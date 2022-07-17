@@ -3,12 +3,12 @@
 use std::ops::{BitAnd, BitXor, Shl};
 
 use crate::context;
-use log::trace;
+use log::{debug, trace};
 use modular_bitfield::prelude::*;
 use super_sabicom_macro::opcodes;
 
-pub trait Context: context::Bus + context::Timing {}
-impl<T: context::Bus + context::Timing> Context for T {}
+pub trait Context: context::Bus + context::Interrupt + context::Timing {}
+impl<T: context::Bus + context::Interrupt + context::Timing> Context for T {}
 
 const RESET_VECTOR: u16 = 0xFFFC;
 
@@ -17,6 +17,49 @@ const INTERNAL_CYCLE: u64 = 6;
 #[derive(Default)]
 pub struct Cpu {
     pub regs: Registers,
+}
+
+#[derive(Debug)]
+enum Exception {
+    Brk,
+    Cop,
+    Nmi,
+    Irq,
+}
+
+impl Exception {
+    fn vector_addr(&self, is_6502_mode: bool) -> u16 {
+        match self {
+            Exception::Brk => {
+                if is_6502_mode {
+                    0xFFFE
+                } else {
+                    0xFFE6
+                }
+            }
+            Exception::Cop => {
+                if is_6502_mode {
+                    0xFFF4
+                } else {
+                    0xFFE4
+                }
+            }
+            Exception::Irq => {
+                if is_6502_mode {
+                    0xFFFE
+                } else {
+                    0xFFEE
+                }
+            }
+            Exception::Nmi => {
+                if is_6502_mode {
+                    0xFFFA
+                } else {
+                    0xFFEA
+                }
+            }
+        }
+    }
 }
 
 pub struct Registers {
@@ -310,8 +353,39 @@ impl Cpu {
     //     (b0 as u32) | ((b1 as u32) << 8) | ((b2 as u32) << 16)
     // }
 
+    fn exception(&mut self, ctx: &mut impl Context, e: Exception) {
+        debug!("Exception: {e:?}");
+
+        ctx.elapse(INTERNAL_CYCLE * 2);
+
+        if self.regs.e {
+            // set B (X) flag
+            self.regs
+                .p
+                .set_x(matches!(e, Exception::Brk | Exception::Cop));
+        }
+        self.push16(ctx, self.regs.pc);
+        if !self.regs.e {
+            self.push8(ctx, self.regs.pb);
+        }
+        self.push8(ctx, self.regs.p.into());
+
+        self.regs.p.set_d(false);
+        self.regs.p.set_i(true);
+        self.regs.pb = 0;
+        self.regs.pc = read16(ctx, e.vector_addr(self.regs.e) as u32);
+    }
+
     pub fn exec_one(&mut self, ctx: &mut impl Context) {
-        // TODO: IRQ/NMI
+        if ctx.nmi() {
+            self.exception(ctx, Exception::Nmi);
+            return;
+        }
+
+        if !self.regs.p.i() && ctx.irq() {
+            self.exception(ctx, Exception::Irq);
+            return;
+        }
 
         if log::log_enabled!(log::Level::Trace) {
             self.trace(ctx);
@@ -572,10 +646,10 @@ impl Cpu {
 
             // misc
             (brk) => {
-                todo!("brk")
+                self.exception(ctx, Exception::Brk)
             };
             (cop) => {
-                todo!("cop")
+                self.exception(ctx, Exception::Cop)
             };
 
             // flags

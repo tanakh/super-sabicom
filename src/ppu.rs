@@ -362,12 +362,12 @@ impl Ppu {
                 self.x = 0;
                 self.y += 1;
 
-                debug!("Line: {}", self.y);
+                debug!("Line: {}:{}", self.frame, self.y);
 
                 if self.y == LINES_PER_FRAME {
                     self.y = 0;
                     self.frame += 1;
-                    debug!("Frame: {}", self.frame);
+                    debug!("Start Frame: {}", self.frame);
 
                     // clear vblank flag, reset NMI flag
                     // TODO: clear vblank flag
