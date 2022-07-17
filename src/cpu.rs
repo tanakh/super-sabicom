@@ -1,3 +1,5 @@
+#![allow(unused_braces)]
+
 use std::ops::{BitAnd, BitXor, Shl};
 
 use crate::context;
@@ -444,15 +446,17 @@ impl Cpu {
                     let b = read8(ctx, addr);
                     let a = reg!(a) as u8;
                     let c = a & b;
-                    self.regs.set_nz(c);
-                    self.regs.p.set_v(c & (1 << 6) != 0);
+                    self.regs.p.set_z(c == 0);
+                    self.regs.p.set_n(b & (1 << 7) != 0);
+                    self.regs.p.set_v(b & (1 << 6) != 0);
                 } else {
                     let addr = addr!($opr, u16);
                     let b = read16(ctx, addr);
                     let a = reg!(a) as u16;
                     let c = a & b;
-                    self.regs.set_nz(c);
-                    self.regs.p.set_v(c & (1 << 14) != 0);
+                    self.regs.p.set_z(c == 0);
+                    self.regs.p.set_n(b & (1 << 15) != 0);
+                    self.regs.p.set_v(b & (1 << 14) != 0);
                 }
             };
 
@@ -987,7 +991,7 @@ impl Cpu {
         );
 
         trace!(
-            "{:02X}:{:04X} {asm:32} A:{:04X} X:{:04X} Y:{:04X} S:{:04X} D:{:04X} DB:{:02X} PB:{:02X} P:{}{}{}{}{}{}{}{}{}",
+            "{:02X}:{:04X}  {asm:32} A:{:04X} X:{:04X} Y:{:04X} S:{:04X} D:{:04X} DB:{:02X} PB:{:02X} P:{}{}{}{}{}{}{}{}{} CYC: {}",
             self.regs.pb,
             self.regs.pc,
             self.regs.a,
@@ -1006,6 +1010,7 @@ impl Cpu {
             if self.regs.p.i() {'I'} else {'i'},
             if self.regs.p.z() {'Z'} else {'z'},
             if self.regs.p.c() {'C'} else {'c'},
+            ctx.now(),
         );
     }
 

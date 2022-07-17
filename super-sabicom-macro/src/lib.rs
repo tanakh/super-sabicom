@@ -178,7 +178,7 @@ pub fn context(_attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
-    eprintln!("{}", ret.to_string());
+    // eprintln!("{}", ret.to_string());
 
     ret.into()
 }

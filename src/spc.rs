@@ -1,9 +1,8 @@
-use std::{
-    fmt::Display,
-    ops::{BitAnd, BitXor, Neg, Not, Shl},
-};
+#![allow(unused_braces)]
 
-use log::{debug, info, trace, warn, Level};
+use std::fmt::Display;
+
+use log::{debug, trace, warn, Level};
 use modular_bitfield::prelude::*;
 use super_sabicom_macro::opcodes;
 
@@ -1142,7 +1141,7 @@ impl Spc {
             || "          invalid".into(),
             |(bytes, asm)| {
                 format!(
-                    "{:9} {asm}",
+                    "{:12} {asm}",
                     bytes
                         .into_iter()
                         .map(|b| format!("{b:02X}"))

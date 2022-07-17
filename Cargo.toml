@@ -10,6 +10,7 @@ edition = "2021"
 
 [dependencies]
 super-sabicom-macro = { path = "super-sabicom-macro", version = "0.1" }
+educe = { version = "0.4.19", features = ["Default"], default-features = false }
 log = "0.4.17"
 modular-bitfield = "0.11.2"
 thiserror = "1.0.31"
