@@ -62,7 +62,6 @@ impl EmulatorCore for Snes {
         let rom = self.ctx.rom();
         vec![
             ("Title".into(), String::from_utf8_lossy(&rom.title).into()),
-            ("HiRom".into(), if rom.is_hirom { "Y" } else { "N" }.into()),
             ("Speed".into(), format!("{:?}", rom.speed)),
             ("MapMode".into(), format!("{:?}", rom.map_mode)),
             ("Chipset".into(), format!("{}", rom.chipset)),

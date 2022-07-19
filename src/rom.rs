@@ -6,7 +6,6 @@ use thiserror::Error;
 #[derive(Debug)]
 pub struct Rom {
     pub title: Vec<u8>,
-    pub is_hirom: bool,
     pub speed: Speed,
     pub map_mode: MapMode,
     pub chipset: Chipset,
@@ -216,6 +215,8 @@ fn parse_coprocessor(c: u8, subclass: u8) -> Coprocessor {
 pub enum RomError {
     #[error("invalid rom size")]
     InvalidRomSize,
+    #[error("invalid title string")]
+    InvalidTitleString,
     #[error("unknown rom type")]
     UnknownRomType,
 }
@@ -230,103 +231,98 @@ impl Rom {
             Err(RomError::InvalidRomSize)?
         };
 
-        let is_hirom = if is_lorom(bytes) {
-            false
-        } else if is_hirom(bytes) {
-            true
-        } else {
-            warn!("Invalid checksum");
-            if bytes.len() == 0x8000 {
-                false
-            } else {
-                Err(RomError::UnknownRomType)?
-            }
-        };
-
-        let header = if !is_hirom {
-            &bytes[0x7F00..=0x7FFF]
-        } else {
-            &bytes[0xFF00..=0xFFFF]
-        };
-
-        let title = header[0xC0..=0xD4].to_vec();
-
-        let v = header[0xD5];
-
-        if v & 0xE0 != 0x20 {
-            warn!("Invalid data in header at 0xFFD5: {v:#04X}");
-        }
-
-        let speed = Speed::from((v >> 4) & 1);
-        let map_mode = MapMode::from(v & 0xF);
-
-        let chipset = parse_chipset(header[0xD6], header[0xBF]);
-
-        if !chipset.is_valid {
-            warn!(
-                "Invalid chipset: code={:#04X}, subclass={:#04X}",
-                header[0xD6], header[0xBF]
-            );
-        }
-
-        let rom_size_code = header[0xD7];
-        if rom_size_code == 0 || rom_size_code >= 0xD {
-            todo!("Too large rom size in header: {rom_size_code}");
-        }
-
-        // Number of banks (bank = 32KB)
-        const ROM_SIZE_TABLE: &[usize] = &[0, 1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 64, 128];
-
-        let rom_size = ROM_SIZE_TABLE[rom_size_code as usize] * 32 * 1024;
-        if !(rom_size / 2 + 1..=rom_size).contains(&bytes.len()) {
-            warn!(
-                "ROM size does not match with headers info: expected: {rom_size}, actual: {}",
-                bytes.len()
-            );
-        }
-
-        if rom_size != bytes.len() {
-            todo!("Support odd sized ROM");
-        }
-
-        let ram_size_code = header[0xD8];
-        if ram_size_code > 5 {
-            warn!("Too large ram size in header: {ram_size_code:#04X}");
-        }
-
-        let ram_size = if ram_size_code == 0 {
-            0
-        } else {
-            1 << (10 + ram_size_code as u32)
-        };
-
-        let country = header[0xD9];
-
-        let developer_id = header[0xDA];
-
-        let game_code = if developer_id == 0x33 {
-            Some(header[0xB2..0xB6].try_into().unwrap())
-        } else {
-            None
-        };
-
-        let rom_version = header[0xD8];
-
-        Ok(Self {
-            title,
-            is_hirom,
-            speed,
-            map_mode,
-            chipset,
-            rom_size,
-            ram_size,
-            country,
-            developer_id,
-            game_code,
-            rom_version,
-            rom: bytes.to_vec(),
-        })
+        try_from_bytes(bytes, 0x7F00).or_else(|_| try_from_bytes(bytes, 0xFF00))
     }
+}
+
+fn try_from_bytes(bytes: &[u8], header_pos: usize) -> Result<Rom, RomError> {
+    if header_pos + 0x100 > bytes.len() {
+        Err(RomError::UnknownRomType)?
+    }
+    let header = &bytes[header_pos..header_pos + 0x100];
+
+    let title = header[0xC0..=0xD4].to_vec();
+    if !title.iter().all(|&b| b.is_ascii_uppercase() || b == b' ') {
+        Err(RomError::InvalidTitleString)?
+    }
+
+    let v = header[0xD5];
+
+    if v & 0xE0 != 0x20 {
+        warn!("Invalid data in header at 0xFFD5: {v:#04X}");
+    }
+
+    let speed = Speed::from((v >> 4) & 1);
+    let map_mode = MapMode::from(v & 0xF);
+
+    let chipset = parse_chipset(header[0xD6], header[0xBF]);
+
+    if !chipset.is_valid {
+        warn!(
+            "Invalid chipset: code={:#04X}, subclass={:#04X}",
+            header[0xD6], header[0xBF]
+        );
+    }
+
+    let rom_size_code = header[0xD7];
+    if rom_size_code == 0 || rom_size_code >= 0xD {
+        todo!("Too large rom size in header: {rom_size_code}");
+    }
+
+    // Number of banks (bank = 32KB)
+    const ROM_SIZE_TABLE: &[usize] = &[0, 1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 64, 128];
+
+    let rom_size = ROM_SIZE_TABLE[rom_size_code as usize] * 32 * 1024;
+    if !(rom_size / 2 + 1..=rom_size).contains(&bytes.len()) {
+        warn!(
+            "ROM size does not match with headers info: expected: {rom_size}, actual: {}",
+            bytes.len()
+        );
+    }
+
+    if rom_size != bytes.len() {
+        warn!(
+            "Odd sized ROM: expected: {rom_size}({rom_size_code}), actual: {}",
+            bytes.len()
+        );
+    }
+
+    let ram_size_code = header[0xD8];
+    if ram_size_code > 5 {
+        warn!("Too large ram size in header: {ram_size_code:#04X}");
+    }
+
+    let ram_size = if ram_size_code == 0 {
+        0
+    } else {
+        1 << (10 + ram_size_code as u32)
+    };
+
+    let country = header[0xD9];
+
+    let developer_id = header[0xDA];
+
+    let game_code = if developer_id == 0x33 {
+        Some(header[0xB2..0xB6].try_into().unwrap())
+    } else {
+        None
+    };
+
+    let rom_version = header[0xD8];
+
+    Ok(Rom {
+        title,
+        speed,
+        map_mode,
+        chipset,
+        rom_size,
+        ram_size,
+        country,
+        developer_id,
+        game_code,
+        rom_version,
+        rom: bytes.to_vec(),
+    })
 }
 
 fn is_lorom(bytes: &[u8]) -> bool {
