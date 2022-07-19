@@ -13,7 +13,7 @@ impl<T: context::Ppu + context::Spc + context::Rom + context::Interrupt + contex
 }
 
 pub struct Bus {
-    memory2_access_cycle: u64,
+    ws2_access_cycle: u64,
     interrupt_enable: InterruptEnable,
     mul_a: u8,
     mul_b: u8,
@@ -107,7 +107,7 @@ struct HdmaLineCounter {
 impl Default for Bus {
     fn default() -> Self {
         Self {
-            memory2_access_cycle: 8,
+            ws2_access_cycle: 8,
             interrupt_enable: InterruptEnable::default(),
             mul_a: 0xFF,
             mul_b: 0xFF,
@@ -144,7 +144,7 @@ impl Bus {
         let offset = addr as u16;
 
         let data = match bank {
-            0x00..=0x3F => match offset {
+            0x00..=0x3F | 0x80..=0xBF => match offset {
                 0x0000..=0x1FFF => {
                     ctx.elapse(CYCLES_SLOW);
                     self.wram[offset as usize]
@@ -171,9 +171,13 @@ impl Bus {
                     panic!("Read expantion region: {bank:02X}:{offset:04X}")
                 }
                 0x8000..=0xFFFF => {
-                    // WS1 LoROM
-                    ctx.elapse(CYCLES_SLOW);
-                    let rom_offset = (bank << 15) | addr & 0x7FFF;
+                    // LoROM
+                    ctx.elapse(if bank & 0x80 == 0 {
+                        CYCLES_SLOW
+                    } else {
+                        self.ws2_access_cycle
+                    });
+                    let rom_offset = (bank & 0x3F) << 15 | addr & 0x7FFF;
                     ctx.rom().rom[rom_offset as usize]
                 }
             },
@@ -193,11 +197,11 @@ impl Bus {
         let offset = addr as u16;
 
         Some(match bank {
-            0x00..=0x3F => match offset {
+            0x00..=0x3F | 0x80..=0xBF => match offset {
                 0x0000..=0x1FFF => self.wram[offset as usize],
                 0x8000..=0xFFFF => {
-                    // WS1 LoROM
-                    let rom_offset = (bank << 15) | addr & 0x7FFF;
+                    // LoROM
+                    let rom_offset = (bank & 0x3F) << 15 | addr & 0x7FFF;
                     ctx.rom().rom[rom_offset as usize]
                 }
                 _ => None?,
@@ -214,7 +218,7 @@ impl Bus {
         trace!("Write:  {bank:02X}:{offset:04X} = {data:#04X}");
 
         match bank {
-            0x00..=0x3F => match offset {
+            0x00..=0x3F | 0x80..=0xBF => match offset {
                 0x0000..=0x1FFF => {
                     ctx.elapse(CYCLES_SLOW);
                     self.wram[offset as usize] = data;
@@ -347,7 +351,7 @@ impl Bus {
             0x420A => self.v_count = self.v_count & 0x00FF | ((data as u16) << 8),
             0x420B => self.gdma_enable = data,
             0x420C => self.hdma_enable = data,
-            0x420D => self.memory2_access_cycle = if data & 1 == 0 { 8 } else { 6 },
+            0x420D => self.ws2_access_cycle = if data & 1 == 0 { 8 } else { 6 },
 
             // CPU DMA, For below ports, x = Channel number 0..7 (R/W)
             0x4300..=0x437F => self.dma_write(((addr >> 4) & 0x7) as _, (addr & 0xF) as _, data),

@@ -111,7 +111,7 @@ impl Default for Registers {
 impl Registers {
     #[inline]
     fn pc24(&self) -> u32 {
-        (self.pb as u32) << 24 | self.pc as u32
+        (self.pb as u32) << 16 | self.pc as u32
     }
 
     #[inline]
@@ -603,13 +603,13 @@ impl Cpu {
             (jmp far) => {{
                 let addr = self.fetch24(ctx);
                 self.regs.pc = addr as u16;
-                self.regs.pb = (addr >> 24) as u8;
+                self.regs.pb = (addr >> 16) as u8;
             }};
             (jmp aif) => {{
                 let addr = self.fetch16(ctx) as u32;
                 let addr = read24(ctx, addr);
                 self.regs.pc = addr as u16;
-                self.regs.pb = (addr >> 24) as u8;
+                self.regs.pb = (addr >> 16) as u8;
             }};
             (jmp $addr:ident) => {{
                 let addr = addr!($addr);
@@ -626,7 +626,7 @@ impl Cpu {
                 self.push16(ctx, self.regs.pc);
                 self.push8(ctx, self.regs.pb);
                 self.regs.pc = addr as u16;
-                self.regs.pb = (addr >> 24) as u8;
+                self.regs.pb = (addr >> 16) as u8;
             }};
             (jsr aix) => {{
                 let addr = addr!(aix);
