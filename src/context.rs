@@ -9,9 +9,13 @@ pub trait Cpu {
 
 #[delegate]
 pub trait Bus {
+    fn bus(&self) -> &bus::Bus;
+    fn bus_mut(&mut self) -> &mut bus::Bus;
+
     fn read(&mut self, addr: u32) -> u8;
     fn read_pure(&self, addr: u32) -> Option<u8>;
     fn write(&mut self, addr: u32, data: u8);
+    fn bus_tick(&mut self);
 }
 
 #[delegate]
@@ -26,6 +30,9 @@ pub trait Ppu {
 
 #[delegate]
 pub trait Spc {
+    fn spc(&self) -> &spc::Spc;
+    fn spc_mut(&mut self) -> &mut spc::Spc;
+
     fn spc_tick(&mut self);
 }
 
@@ -97,6 +104,13 @@ impl Cpu for Context {
 }
 
 impl Bus for Inner1 {
+    fn bus(&self) -> &bus::Bus {
+        &self.bus
+    }
+    fn bus_mut(&mut self) -> &mut bus::Bus {
+        &mut self.bus
+    }
+
     fn read(&mut self, addr: u32) -> u8 {
         self.bus.read(&mut self.inner, addr)
     }
@@ -107,6 +121,10 @@ impl Bus for Inner1 {
 
     fn write(&mut self, addr: u32, data: u8) {
         self.bus.write(&mut self.inner, addr, data)
+    }
+
+    fn bus_tick(&mut self) {
+        self.bus.tick(&mut self.inner)
     }
 }
 
@@ -132,6 +150,13 @@ impl Ppu for Inner2 {
 }
 
 impl Spc for Inner2 {
+    fn spc(&self) -> &spc::Spc {
+        &self.spc
+    }
+    fn spc_mut(&mut self) -> &mut spc::Spc {
+        &mut self.spc
+    }
+
     fn spc_tick(&mut self) {
         self.spc.tick(&mut self.inner)
     }

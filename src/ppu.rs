@@ -2,6 +2,7 @@
 
 use educe::Educe;
 use log::debug;
+use meru_interface::{FrameBuffer, Pixel};
 use modular_bitfield::prelude::*;
 
 use crate::{consts::*, context};
@@ -19,8 +20,8 @@ pub struct Ppu {
     mosaic: Mosaic,
     bg_sc: [ScreenBaseAndSize; 4],
     bg_tile_base_addr: [u8; 4],
-    bg_horizontal_scroll: [u8; 4],
-    bg_vertical_scroll: [u8; 4],
+    bg_hofs: [u16; 4],
+    bg_vofs: [u16; 4],
     rot_param: RotParam,
     win_mask: WinMask,
     win_pos: [WinPos; 2],
@@ -42,8 +43,8 @@ pub struct Ppu {
     oam_addr_internal: u16,
     oam_lsb: u8,
 
-    #[educe(Default(expression = "vec![0; 0x200]"))]
-    cgram: Vec<u8>,
+    #[educe(Default(expression = "vec![0; 0x100]"))]
+    cgram: Vec<u16>,
     cgram_addr: u16,
     cgram_lsb: u8,
 
@@ -51,6 +52,14 @@ pub struct Ppu {
     y: u32,
     frame: u64,
     counter: u64,
+
+    #[educe(Default(
+        expression = "FrameBuffer::new(SCREEN_WIDTH.try_into().unwrap(), SCREEN_HEIGHT.try_into().unwrap())"
+    ))]
+    frame_buffer: FrameBuffer,
+
+    #[educe(Default(expression = "vec![0; SCREEN_WIDTH.try_into().unwrap()]"))]
+    line_buffer: Vec<u16>,
 }
 
 #[bitfield(bits = 16)]
@@ -160,9 +169,15 @@ struct OamAddr {
 #[bitfield(bits = 8)]
 #[derive(Default)]
 struct BgMode {
-    bg_mode: B3,
+    mode: B3,
     bg3_priority_is_high: bool,
-    bg_tile_size: B4,
+    tile_sizes: B4,
+}
+
+impl BgMode {
+    fn tile_size(&self, i: usize) -> bool {
+        self.tile_sizes() & (1 << i) != 0
+    }
 }
 
 #[bitfield(bits = 8)]
@@ -348,6 +363,10 @@ impl Ppu {
     pub fn frame(&self) -> u64 {
         self.frame
     }
+
+    pub fn frame_buffer(&self) -> &FrameBuffer {
+        &self.frame_buffer
+    }
 }
 
 impl Ppu {
@@ -388,14 +407,19 @@ impl Ppu {
                 // FIXME: clear hblank flag
             }
 
+            if self.x == 22 {
+                if (1..1 + SCREEN_HEIGHT).contains(&self.y) {
+                    self.render_line(self.y - 1);
+                    self.copy_line_buffer(self.y - 1);
+                }
+            }
+
             if self.x == 274 {
                 // FIXME: set hblank flag
-
-                // self.render_line();
             }
 
             if self.x == 278 {
-                // TODO:  perform HDMA transfers
+                // TODO: perform HDMA transfers
             }
         }
     }
@@ -436,11 +460,11 @@ impl Ppu {
             }
             0x210D | 0x210F | 0x2111 | 0x2113 => {
                 let ix = (addr - 0x210D) as usize / 2;
-                self.bg_horizontal_scroll[ix] = data;
+                self.bg_hofs[ix] = self.bg_hofs[ix].wrapping_shl(8) | data as u16;
             }
             0x210E | 0x2110 | 0x2112 | 0x2114 => {
                 let ix = (addr - 0x210E) as usize / 2;
-                self.bg_vertical_scroll[ix] = data;
+                self.bg_vofs[ix] = self.bg_vofs[ix].wrapping_shl(8) | data as u16;
             }
             0x2115 => self.vram_addr_inc_mode.bytes[0] = data,
             0x2116 => self.vram_addr = self.vram_addr & 0x7F00 | data as u16,
@@ -462,11 +486,13 @@ impl Ppu {
             0x2120 => self.rot_param.y = self.rot_param.y << 8 | data as u16,
             0x2121 => self.cgram_addr = data as u16 * 2,
             0x2122 => {
+                debug!("CGRAM: {:03X} = {data:02X}", self.cgram_addr);
+
                 if self.cgram_addr & 1 == 0 {
                     self.cgram_lsb = data;
                 } else {
-                    self.cgram[self.cgram_addr as usize - 1] = self.cgram_lsb;
-                    self.cgram[self.cgram_addr as usize] = data;
+                    self.cgram[self.cgram_addr as usize / 2] =
+                        self.cgram_lsb as u16 | (data as u16) << 8;
                 }
                 self.cgram_addr = (self.cgram_addr + 1) & 0x1FF;
             }
@@ -503,4 +529,159 @@ impl Ppu {
             _ => todo!("PPU Write: {addr:#06X} = {data:#04X}"),
         }
     }
+}
+
+enum ColorMode {
+    Color4,
+    Color16,
+    Color256,
+}
+
+#[bitfield(bits = 16)]
+struct BgMapEntry {
+    char_num: B10,
+    pal_num: B3,
+    priority: B1,
+    x_flip: bool,
+    y_flip: bool,
+}
+
+impl Ppu {
+    fn render_line(&mut self, y: u32) {
+        if self.display_ctrl.force_blank() {
+            self.line_buffer.fill(0);
+            return;
+        }
+
+        // Backdrop
+        self.line_buffer.fill(self.cgram[0]);
+
+        match self.bg_mode.mode() {
+            0 => {
+                for i in 0..4 {
+                    self.render_bg(y, i, ColorMode::Color4);
+                }
+            }
+            1 => todo!("BG Mode 1"),
+            2 => todo!("BG Mode 2"),
+            3 => todo!("BG Mode 3"),
+            4 => todo!("BG Mode 4"),
+            5 => todo!("BG Mode 5"),
+            6 => todo!("BG Mode 6"),
+            7 => todo!("BG Mode 7"),
+            _ => unreachable!(),
+        }
+
+        // Obj
+
+        // todo!()
+    }
+
+    fn copy_line_buffer(&mut self, y: u32) {
+        for x in 0..SCREEN_WIDTH {
+            *self.frame_buffer.pixel_mut(x as usize, y as usize) =
+                u16_to_pixel(self.line_buffer[x as usize]);
+        }
+    }
+
+    fn render_bg(&mut self, y: u32, i: usize, mode: ColorMode) {
+        if !self.screen_desig_main.bg(i) {
+            return;
+        }
+
+        if self.bg_mode.tile_size(i) {
+            todo!("16 x 16 Tile mode");
+        }
+
+        if !matches!(mode, ColorMode::Color4) {
+            todo!("Not 4-color mode");
+        }
+
+        if y == 0 {
+            debug!("Render: BG{i}");
+        }
+
+        // FIXME: base_addr is 6bit (0x3F * 2K = 126K), but VRAM is 64KB. ???
+        let sc_base_addr = self.bg_sc[i].base_addr() as usize * 2 * 1024;
+        let sc_size = self.bg_sc[i].size();
+
+        let tile_base_addr = self.bg_tile_base_addr[i] as usize * 8 * 1024;
+
+        let hofs = (self.bg_hofs[i] & 0x3FF) as usize;
+        let vofs = (self.bg_vofs[i] & 0x3FF) as usize;
+
+        // TODO: mosaic
+        // TODO: window
+
+        let bpp = match mode {
+            ColorMode::Color4 => 2,
+            ColorMode::Color16 => 4,
+            ColorMode::Color256 => 8,
+        };
+
+        let pal_size = 1 << bpp;
+
+        let (sc_w, sc_h) = match sc_size {
+            ScreenSize::OneScreen => (1, 1),
+            ScreenSize::VMirror => (1, 2),
+            ScreenSize::HMirror => (2, 1),
+            ScreenSize::FourScren => (2, 2),
+        };
+
+        let sy = y as usize + hofs;
+
+        const SC_SIZE: usize = 32 * 32 * 2;
+
+        for x in 0..SCREEN_WIDTH {
+            let sx = x as usize + vofs;
+            let sc_x = sx / 8 / 32 % sc_w;
+            let sc_y = sy / 8 / 32 % sc_h;
+            let tile_x = sx / 8 % 32;
+            let tile_y = sy / 8 % 32;
+            let pixel_x = sx % 8;
+            let pixel_y = sy % 8;
+
+            let sc_addr = sc_base_addr + (sc_x + sc_y * sc_w) * SC_SIZE;
+            let entry_addr = (sc_addr + (tile_x + tile_y * 32) * 2) & 0xFFFE;
+
+            // debug!(
+            //     "SC Base: {}, base addr: {sc_base_addr:04X}, sc: ({sc_x}/{sc_w}, {sc_y}/{sc_h}), tile: ({tile_x}, {tile_y}), entry: {entry_addr:04X}",
+            //     self.bg_sc[i].base_addr()
+            // );
+
+            let entry =
+                BgMapEntry::from_bytes(self.vram[entry_addr..entry_addr + 2].try_into().unwrap());
+
+            let pixel_x = if entry.x_flip() { pixel_x } else { 7 - pixel_x };
+            let pixel_y = if entry.y_flip() { 7 - pixel_y } else { pixel_y };
+
+            // TODO: Priority
+
+            let tile_addr = tile_base_addr + entry.char_num() as usize * bpp as usize * 8;
+
+            let mut pixel = 0;
+            for i in 0..bpp / 2 {
+                let addr = tile_addr + i * 16 + pixel_y * 2;
+                let b0 = self.vram[addr];
+                let b1 = self.vram[addr + 1];
+                pixel |= ((b0 >> pixel_x) & 1) | (((b1 >> pixel_x) & 1) << 1) << (i * 2);
+            }
+
+            if pixel != 0 {
+                let col = self.cgram[entry.pal_num() as usize * pal_size + pixel as usize];
+                self.line_buffer[x as usize] = col;
+            }
+        }
+    }
+}
+
+fn u16_to_pixel(p: u16) -> Pixel {
+    let r = (p & 0x1F) as u8;
+    let g = ((p >> 5) & 0x1F) as u8;
+    let b = ((p >> 10) & 0x1F) as u8;
+
+    fn extend(c: u8) -> u8 {
+        c << 3 | c >> 2
+    }
+    Pixel::new(extend(r), extend(g), extend(b))
 }

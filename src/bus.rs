@@ -1,10 +1,16 @@
-use log::{info, trace};
+use log::{debug, info, trace};
 use modular_bitfield::prelude::*;
 
 use crate::context;
 
-pub trait Context: context::Ppu + context::Rom + context::Interrupt + context::Timing {}
-impl<T: context::Ppu + context::Rom + context::Interrupt + context::Timing> Context for T {}
+pub trait Context:
+    context::Ppu + context::Spc + context::Rom + context::Interrupt + context::Timing
+{
+}
+impl<T: context::Ppu + context::Spc + context::Rom + context::Interrupt + context::Timing> Context
+    for T
+{
+}
 
 pub struct Bus {
     memory2_access_cycle: u64,
@@ -18,6 +24,8 @@ pub struct Bus {
     gdma_enable: u8,
     hdma_enable: u8,
     dma: [Dma; 8],
+
+    locked: bool,
 
     wram: Vec<u8>,
     wram_addr: u32,
@@ -110,6 +118,7 @@ impl Default for Bus {
             gdma_enable: 0,
             hdma_enable: 0,
             dma: Default::default(),
+            locked: false,
             wram: vec![0; 0x20000], // 128KB
             wram_addr: 0,
         }
@@ -121,6 +130,15 @@ const CYCLES_FAST: u64 = 6;
 const CYCLES_JOY: u64 = 12;
 
 impl Bus {
+    pub fn locked(&self) -> bool {
+        self.locked
+    }
+
+    pub fn tick(&mut self, ctx: &mut impl Context) {
+        self.locked = false;
+        self.dma_exec(ctx);
+    }
+
     pub fn read(&mut self, ctx: &mut impl Context, addr: u32) -> u8 {
         let bank = addr >> 16;
         let offset = addr as u16;
@@ -239,6 +257,8 @@ impl Bus {
 
     fn io_read(&mut self, ctx: &mut impl Context, addr: u16) -> u8 {
         let data = match addr {
+            0x2140..=0x217F => ctx.spc().read_port((addr & 3) as _),
+
             // CPU On-Chip I/O Ports (Write-only) (Read=open bus)
             0x4200..=0x420F => !0,
 
@@ -271,7 +291,7 @@ impl Bus {
             ),
         };
 
-        info!(
+        debug!(
             "Read I/O: {addr:#06X}{} = {data:#04X}",
             ioreg_info(addr).map_or_else(|| "".to_string(), |info| format!("({})", info.name))
         );
@@ -279,13 +299,15 @@ impl Bus {
     }
 
     fn io_write(&mut self, ctx: &mut impl Context, addr: u16, data: u8) {
-        info!(
+        debug!(
             "Write I/O: {addr:#06X}{} = {data:#04X}",
             ioreg_info(addr).map_or_else(|| "".to_string(), |info| format!("({})", info.name))
         );
 
         match addr {
             0x2100..=0x213F => ctx.ppu_write(addr, data),
+
+            0x2140..=0x217F => ctx.spc_mut().write_port((addr & 3) as _, data),
 
             0x2180 => {
                 self.wram[self.wram_addr as usize] = data;
@@ -328,58 +350,90 @@ impl Bus {
             0x420D => self.memory2_access_cycle = if data & 1 == 0 { 8 } else { 6 },
 
             // CPU DMA, For below ports, x = Channel number 0..7 (R/W)
-            0x4300 | 0x4310 | 0x4320 | 0x4330 | 0x4340 | 0x4350 | 0x4360 | 0x4370 => {
-                let ch = ((addr >> 4) & 7) as usize;
-                self.dma[ch].param.bytes[0] = data;
-            }
-            0x4301 | 0x4311 | 0x4321 | 0x4331 | 0x4341 | 0x4351 | 0x4361 | 0x4371 => {
-                let ch = ((addr >> 4) & 7) as usize;
-                self.dma[ch].iobus_addr = data;
-            }
-            0x4302 | 0x4312 | 0x4322 | 0x4332 | 0x4342 | 0x4352 | 0x4362 | 0x4372 => {
-                let ch = ((addr >> 4) & 7) as usize;
-                self.dma[ch].cur_addr = self.dma[ch].cur_addr & 0xFF00 | data as u16;
-            }
-            0x4303 | 0x4313 | 0x4323 | 0x4333 | 0x4343 | 0x4353 | 0x4363 | 0x4373 => {
-                let ch = ((addr >> 4) & 7) as usize;
-                self.dma[ch].cur_addr = self.dma[ch].cur_addr & 0x00FF | ((data as u16) << 8);
-            }
-            0x4304 | 0x4314 | 0x4324 | 0x4334 | 0x4344 | 0x4354 | 0x4364 | 0x4374 => {
-                let ch = ((addr >> 4) & 7) as usize;
-                self.dma[ch].cur_bank = data;
-            }
-            0x4305 | 0x4315 | 0x4325 | 0x4335 | 0x4345 | 0x4355 | 0x4365 | 0x4375 => {
-                let ch = ((addr >> 4) & 7) as usize;
-                self.dma[ch].byte_count = self.dma[ch].byte_count & 0xFF00 | data as u16;
-            }
-            0x4306 | 0x4316 | 0x4326 | 0x4336 | 0x4346 | 0x4356 | 0x4366 | 0x4376 => {
-                let ch = ((addr >> 4) & 7) as usize;
-                self.dma[ch].byte_count = self.dma[ch].byte_count & 0x00FF | ((data as u16) << 8);
-            }
-            0x4307 | 0x4317 | 0x4327 | 0x4337 | 0x4347 | 0x4357 | 0x4367 | 0x4377 => {
-                let ch = ((addr >> 4) & 7) as usize;
-                self.dma[ch].indirect_hdma_bank = data;
-            }
-            0x4308 | 0x4318 | 0x4328 | 0x4338 | 0x4348 | 0x4358 | 0x4368 | 0x4378 => {
-                let ch = ((addr >> 4) & 7) as usize;
-                self.dma[ch].hdma_cur_addr = self.dma[ch].hdma_cur_addr & 0xFF00 | data as u16;
-            }
-            0x4309 | 0x4319 | 0x4329 | 0x4339 | 0x4349 | 0x4359 | 0x4369 | 0x4379 => {
-                let ch = ((addr >> 4) & 7) as usize;
-                self.dma[ch].hdma_cur_addr =
-                    self.dma[ch].hdma_cur_addr & 0x00FF | ((data as u16) << 8);
-            }
-            0x430A | 0x431A | 0x432A | 0x433A | 0x434A | 0x435A | 0x436A | 0x437A => {
-                let ch = ((addr >> 4) & 7) as usize;
-                self.dma[ch].hdma_line_counter.bytes[0] = data;
-            }
-            0x430B | 0x431B | 0x432B | 0x433B | 0x434B | 0x435B | 0x436B | 0x437B | // mirror
-            0x430F | 0x431F | 0x432F | 0x433F | 0x434F | 0x435F | 0x436F | 0x437F => {
-                let ch = ((addr >> 4) & 7) as usize;
-                self.dma[ch].unused = data;
-            }
+            0x4300..=0x437F => self.dma_write(((addr >> 4) & 0x7) as _, (addr & 0xF) as _, data),
             _ => todo!("Write I/O: {addr:#06X} = {data:#04X}"),
         }
+    }
+
+    fn dma_write(&mut self, ch: usize, cmd: u8, data: u8) {
+        match cmd {
+            0 => self.dma[ch].param.bytes[0] = data,
+            1 => self.dma[ch].iobus_addr = data,
+            2 => self.dma[ch].cur_addr = self.dma[ch].cur_addr & 0xFF00 | data as u16,
+            3 => self.dma[ch].cur_addr = self.dma[ch].cur_addr & 0x00FF | ((data as u16) << 8),
+            4 => self.dma[ch].cur_bank = data,
+            5 => self.dma[ch].byte_count = self.dma[ch].byte_count & 0xFF00 | data as u16,
+            6 => self.dma[ch].byte_count = self.dma[ch].byte_count & 0x00FF | ((data as u16) << 8),
+            7 => self.dma[ch].indirect_hdma_bank = data,
+            8 => self.dma[ch].hdma_cur_addr = self.dma[ch].hdma_cur_addr & 0xFF00 | data as u16,
+            9 => {
+                self.dma[ch].hdma_cur_addr =
+                    self.dma[ch].hdma_cur_addr & 0x00FF | ((data as u16) << 8)
+            }
+            0xA => self.dma[ch].hdma_line_counter.bytes[0] = data,
+            0xB | 0xF => self.dma[ch].unused = data,
+
+            _ => panic!("Invalid DMA write: {cmd:0X} = {data:#04X}"),
+        }
+    }
+
+    fn dma_exec(&mut self, ctx: &mut impl Context) {
+        if self.hdma_enable != 0 {
+            let ch = self.hdma_enable.trailing_zeros() as usize;
+            self.hdma_exec(ctx, ch);
+            return;
+        }
+        if self.gdma_enable != 0 {
+            let ch = self.gdma_enable.trailing_zeros() as usize;
+            self.gdma_exec(ctx, ch);
+            return;
+        }
+    }
+
+    fn gdma_exec(&mut self, ctx: &mut impl Context, ch: usize) {
+        let transfer_unit: &[usize] = match self.dma[ch].param.transfer_unit() {
+            0 => &[0],
+            1 => &[0, 1],
+            2 | 6 => &[0, 0],
+            3 | 7 => &[0, 0, 1, 1],
+            4 => &[0, 1, 2, 3],
+            5 => &[0, 1, 0, 1],
+            _ => unreachable!(),
+        };
+
+        let mut a_addr = self.dma[ch].cur_addr;
+        let b_addr = self.dma[ch].iobus_addr;
+
+        debug!(
+            "GDMA[{ch}]: {:02X}:{a_addr:04X} -> 21{b_addr:02X}, trans: {transfer_unit:?}, count: {}",
+            self.dma[ch].cur_bank,
+            self.dma[ch].byte_count,
+        );
+
+        let a_inc = match self.dma[ch].param.abus_addr_step() {
+            DmaAddrStep::Increment => 1,
+            DmaAddrStep::Decrement => (-1_i16) as u16,
+            DmaAddrStep::Fixed | DmaAddrStep::Fixed2 => 0,
+        };
+
+        for i in 0..transfer_unit.len() {
+            let data = self.read(ctx, (self.dma[ch].cur_bank as u32) << 16 | a_addr as u32);
+            self.write(ctx, 0x2100 | b_addr.wrapping_add(i as u8) as u32, data);
+            a_addr = a_addr.wrapping_add(a_inc);
+            self.locked = true;
+
+            self.dma[ch].byte_count = self.dma[ch].byte_count.wrapping_sub(1);
+            if self.dma[ch].byte_count == 0 {
+                self.gdma_enable &= !(1 << ch);
+                break;
+            }
+        }
+
+        self.dma[ch].cur_addr = a_addr;
+    }
+
+    fn hdma_exec(&mut self, ctx: &mut impl Context, ch: usize) {
+        todo!("HDMA");
     }
 }
 

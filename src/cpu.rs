@@ -17,6 +17,8 @@ const INTERNAL_CYCLE: u64 = 6;
 #[derive(Default)]
 pub struct Cpu {
     pub regs: Registers,
+    stop: bool,
+    halt: bool,
 }
 
 #[derive(Debug)]
@@ -242,13 +244,13 @@ opcodes! {
     dec y     ; bit a, imm; mov a, x  ; push db   ; st abs, y ; st abs, a ; st abs, x; st far, a ; // 88
     bcc disp8 ; st iny, a ; st ind, a ; st siy, a ; st zpx, y ; st zpx, a ; st zpy, x; st ify, a ; // 90
     mov a, y  ; st aby, a ; mov s, x  ; mov y, x  ; st abs, zr; st abx, a ; st abx,zr; st fax, a ; // 98
-    ld y, imm ; ld a, inx ; ld x, imm ; ld a, sp  ; ld y, zp  ; ld a, zp  ; ld x, ind; ld a, inf ; // A0
+    ld y, imm ; ld a, inx ; ld x, imm ; ld a, sp  ; ld y, zp  ; ld a, zp  ; ld x, zp ; ld a, inf ; // A0
     mov y, a  ; ld a, imm ; mov x, a  ; pop db    ; ld y, abs ; ld a, abs ; ld x, abs; ld a, far ; // A8
     bcs disp8 ; ld a, iny ; ld a, ind ; ld a, siy ; ld y, zpx ; ld a, zpx ; ld x, zpy; ld a, ify ; // B0
     clv       ; ld a, aby ; mov x, s  ; mov x, y  ; ld y, abx ; ld a, abx ; ld x, aby; ld a, fax ; // B8
     cmp y, imm; cmp a, inx; rep imm   ; cmp a, sp ; cmp y, zp ; cmp a, zp ; dec zp   ; cmp a, inf; // C0
     inc y     ; cmp a, imm; dec x     ; wai       ; cmp y, abs; cmp a, abs; dec abs  ; cmp a, far; // C8
-    bne disp8 ; cmp a, iny; cmp a, ind; cmp a, siy; push zp   ; cmp a, zpx; dec zpx  ; cmp a, ify; // D0
+    bne disp8 ; cmp a, iny; cmp a, ind; cmp a, siy; push ind  ; cmp a, zpx; dec zpx  ; cmp a, ify; // D0
     cld       ; cmp a, aby; push x    ; stp       ; jmp aif   ; cmp a, abx; dec abx  ; cmp a, fax; // D8
     cmp x, imm; sbc a, inx; sep imm   ; sbc a, sp ; cmp x, zp ; sbc a, zp ; inc zp   ; sbc a, inf; // E0
     inc x     ; sbc a, imm; nop       ; xba       ; cmp x, abs; sbc a, abs; inc abs  ; sbc a, far; // E8
@@ -281,12 +283,6 @@ fn write16(ctx: &mut impl Context, addr: u32, data: u16) {
     ctx.write(addr, data as u8);
     ctx.write((addr + 1) & 0x00FFFFFF, (data >> 8) as u8);
 }
-
-// fn write24(ctx: &mut impl Context, addr: u32, data: u32) {
-//     ctx.write(addr, data as u8);
-//     ctx.write((addr + 1) & 0x00FFFFFF, (data >> 8) as u8);
-//     ctx.write((addr + 2) & 0x00FFFFFF, (data >> 16) as u8);
-// }
 
 #[rustfmt::skip]
 macro_rules! is_8bit {
@@ -356,6 +352,7 @@ impl Cpu {
     fn exception(&mut self, ctx: &mut impl Context, e: Exception) {
         debug!("Exception: {e:?}");
 
+        self.halt = false;
         ctx.elapse(INTERNAL_CYCLE * 2);
 
         if self.regs.e {
@@ -377,13 +374,27 @@ impl Cpu {
     }
 
     pub fn exec_one(&mut self, ctx: &mut impl Context) {
+        if ctx.bus().locked() {
+            return;
+        }
+
+        if self.stop {
+            ctx.elapse(INTERNAL_CYCLE);
+            return;
+        }
+
         if ctx.nmi() {
             self.exception(ctx, Exception::Nmi);
             return;
         }
 
-        if !self.regs.p.i() && ctx.irq() {
+        if (self.halt || !self.regs.p.i()) && ctx.irq() {
             self.exception(ctx, Exception::Irq);
+            return;
+        }
+
+        if self.halt {
+            ctx.elapse(INTERNAL_CYCLE);
             return;
         }
 
@@ -444,11 +455,22 @@ impl Cpu {
             };
 
             // push
-            (push p) => {
-                self.push8(ctx, self.regs.p.into())
+            (push p) => {{
+                let mut p = self.regs.p;
+                if self.regs.e {
+                    p.set_m(true);
+                    p.set_x(true);
+                }
+                self.push8(ctx, p.into());
+            }};
+            (push pb) => {
+                self.push8(ctx, self.regs.pb)
             };
-            (push zp) => {{
-                let addr = addr!(zp) as u16;
+            (push db) => {
+                self.push8(ctx, self.regs.db)
+            };
+            (push ind) => {{
+                let addr = addr!(ind) as u16;
                 self.push16(ctx, addr)
             }};
             (push abs) => {{
@@ -462,13 +484,19 @@ impl Cpu {
             (push $reg:ident) => {
                 if is_8bit!(self, $reg) {
                     self.push8(ctx, reg!($reg) as u8)
+                } else {
+                    self.push16(ctx, reg!($reg))
                 }
             };
 
             // pop
-            (pop p) => {
-                self.regs.p = self.pop8(ctx).into()
-            };
+            (pop p) => {{
+                self.regs.p = self.pop8(ctx).into();
+                if self.regs.e {
+                    self.regs.p.set_x(true);
+                    self.regs.p.set_m(true);
+                }
+            }};
             (pop db) => {{
                 let v = self.pop8(ctx);
                 self.regs.set_nz(v);
@@ -514,25 +542,28 @@ impl Cpu {
                 cmp!($reg, $opr)
             };
 
-            (bit a, $opr:ident) => {
+            (bit a, $opr:ident) => {{
+                macro_rules! set_nv {
+                    (imm, $_b:ident, $_:ty) => {};
+                    ($_:ident, $b:ident, $ty:ty) => {{
+                        self.regs.p.set_n($b & (1 << (<$ty>::BITS - 1)) != 0);
+                        self.regs.p.set_v($b & (1 << (<$ty>::BITS - 2)) != 0);
+                    }};
+                }
                 if is_8bit!(self, a) {
                     let addr = addr!($opr, u8);
+                    let a = self.regs.a as u8;
                     let b = read8(ctx, addr);
-                    let a = reg!(a) as u8;
-                    let c = a & b;
-                    self.regs.p.set_z(c == 0);
-                    self.regs.p.set_n(b & (1 << 7) != 0);
-                    self.regs.p.set_v(b & (1 << 6) != 0);
+                    self.regs.p.set_z(a & b == 0);
+                    set_nv!($opr, b, u8);
                 } else {
                     let addr = addr!($opr, u16);
+                    let a = self.regs.a;
                     let b = read16(ctx, addr);
-                    let a = reg!(a) as u16;
-                    let c = a & b;
-                    self.regs.p.set_z(c == 0);
-                    self.regs.p.set_n(b & (1 << 15) != 0);
-                    self.regs.p.set_v(b & (1 << 14) != 0);
+                    self.regs.p.set_z(a & b == 0);
+                    set_nv!($opr, b, u8);
                 }
-            };
+            }};
 
             // rmw
             (inc $opr:ident) => {
@@ -676,7 +707,12 @@ impl Cpu {
             };
             (rep imm) => {{
                 let v = self.fetch8(ctx);
-                self.regs.p = (u8::from(self.regs.p) & !v).into();
+                let mut p: Status = (u8::from(self.regs.p) & !v).into();
+                if self.regs.e {
+                    p.set_x(true);
+                    p.set_m(true);
+                }
+                self.regs.p = p;
             }};
             (sep imm) => {{
                 let v = self.fetch8(ctx);
@@ -686,18 +722,25 @@ impl Cpu {
                 let c = self.regs.p.c();
                 self.regs.p.set_c(self.regs.e);
                 self.regs.e = c;
+                if self.regs.e {
+                    self.regs.p.set_x(true);
+                    self.regs.p.set_m(true);
+                    self.regs.x &= 0xFF;
+                    self.regs.y &= 0xFF;
+                    self.regs.s = 0x100 | self.regs.s & 0xFF;
+                }
             }};
 
             // special
             (stp) => {
-                todo!("stp")
+                self.stop = true
             };
             (xba) => {{
-                self.regs.set_nz(self.regs.a as u8);
                 self.regs.a = self.regs.a.rotate_right(8);
+                self.regs.set_nz(self.regs.a as u8);
             }};
             (wai) => {
-                todo!("wai")
+                self.halt = true
             };
             (wdm imm) => {{
                 // This is 2 byte nop opcode
@@ -714,18 +757,17 @@ impl Cpu {
                 let sb = self.fetch8(ctx);
                 self.regs.db = db;
 
+                let v = read8(ctx, (sb as u32) << 16 | self.regs.x as u32);
+                write8(ctx, (db as u32) << 16 | self.regs.y as u32, v);
+
                 if is_8bit!(self, x) {
-                    let v = read8(ctx, (db as u32) << 16 | self.regs.y as u32);
-                    write8(ctx, (sb as u32) << 16 | self.regs.x as u32, v);
+                    self.regs.x = (self.regs.x as u8).wrapping_add($inc as u8) as u16;
+                    self.regs.y = (self.regs.y as u8).wrapping_add($inc as u8) as u16;
+                } else {
                     self.regs.x = self.regs.x.wrapping_add($inc);
                     self.regs.y = self.regs.y.wrapping_add($inc);
-                } else {
-                    let v = read16(ctx, (db as u32) << 16 | self.regs.y as u32);
-                    write16(ctx, (sb as u32) << 16 | self.regs.x as u32, v);
-                    self.regs.x = self.regs.x.wrapping_add(($inc).wrapping_mul(2));
-                    self.regs.y = self.regs.y.wrapping_add(($inc).wrapping_mul(2));
                 }
-                self.regs.a = self.regs.a.wrapping_sub(0);
+                self.regs.a = self.regs.a.wrapping_sub(1);
 
                 if self.regs.a != 0xFFFF {
                     self.regs.pc = self.regs.pc.wrapping_sub(3);
@@ -739,14 +781,14 @@ impl Cpu {
                     let addr = addr!($opr, u8);
                     let a = reg!($reg) as u8;
                     let b = read8(ctx, addr);
-                    let c = alu_op!($op, a, b);
+                    let c = alu_op!($op, a, b, u8);
                     self.regs.set_nz(c);
                     set_reg!($reg, c);
                 } else {
                     let addr = addr!($opr, u16);
                     let a = reg!($reg);
                     let b = read16(ctx, addr);
-                    let c = alu_op!($op, a, b);
+                    let c = alu_op!($op, a, b, u16);
                     self.regs.set_nz(c);
                     set_reg!($reg, c);
                 }
@@ -774,51 +816,115 @@ impl Cpu {
         }
 
         macro_rules! alu_op {
-            (or, $a:ident, $b:ident) => {
+            (or, $a:ident, $b:ident, $_:ty) => {
                 $a | $b
             };
-            (and, $a:ident, $b:ident) => {
+            (and, $a:ident, $b:ident, $_:ty) => {
                 $a & $b
             };
-            (eor, $a:ident, $b:ident) => {
+            (eor, $a:ident, $b:ident, $_:ty) => {
                 $a ^ $b
             };
-            (adc, $a:ident, $b:ident) => {{
+            (adc, $a:ident, $b:ident, $ty:ident) => {{
                 if self.regs.p.d() {
-                    // decimal
-                    todo!()
+                    let a = $a as u32;
+                    let b = $b as u32;
+
+                    let mut cl = (a & 0x0F) + (b & 0x0F) + self.regs.p.c() as u32;
+                    if cl >= 0xA {
+                        cl = ((cl + 6) & 0xF) + 0x10;
+                    }
+
+                    macro_rules! calc {
+                        (u8) => {{
+                            let mut c = (a & 0xF0) + (b & 0xF0) + cl;
+                            if c >= 0xA0 {
+                                c += 0x60;
+                            }
+                            self.regs.p.set_c(c > 0xFF);
+
+                            let d = (a & 0xF0) as i8 as i32 + (b & 0xF0) as i8 as i32 + cl as i32;
+                            self.regs.p.set_v(d < -0x80 || d > 0x7F);
+
+                            c as u8
+                        }};
+                        (u16) => {{
+                            cl = (a & 0xF0) + (b & 0xF0) + cl;
+                            if cl >= 0xA0 {
+                                cl = ((cl + 0x60) & 0xFF) + 0x100;
+                            }
+                            cl = (a & 0xF00) + (b & 0xF00) + cl;
+                            if cl >= 0xA00 {
+                                cl = ((cl + 0x600) & 0xFFF) + 0x1000;
+                            }
+                            let mut c = (a & 0xF000) + (b & 0xF000) + cl;
+                            if c >= 0xA000 {
+                                c += 0x6000;
+                            }
+                            self.regs.p.set_c(c > 0xFFFF);
+
+                            let d =
+                                (a & 0xF000) as i16 as i32 + (b & 0xF000) as i16 as i32 + cl as i32;
+                            self.regs.p.set_v(d < -0x8000 || d > 0x7FFF);
+
+                            c as u16
+                        }};
+                    }
+
+                    calc!($ty)
                 } else {
-                    let a = $a;
-                    let b = $b;
-                    let c = self.regs.p.c();
+                    let a = $a as u32;
+                    let b = $b as u32;
+                    let c = a + b + self.regs.p.c() as u32;
+                    let ovf = !(a ^ b) & (a ^ c) & (1 << (<$ty>::BITS - 1)) != 0;
 
-                    let (ret, carry1) = a.overflowing_add(b);
-                    let (ret, carry2) = ret.overflowing_add(c as _);
-                    let ovf = check_overflow(a, b, ret);
-
-                    self.regs.p.set_c(carry1 || carry2);
+                    self.regs.p.set_c(c > <$ty>::MAX as u32);
                     self.regs.p.set_v(ovf);
 
-                    ret
+                    c as $ty
                 }
             }};
-            (sbc, $a:ident, $b:ident) => {{
+            (sbc, $a:ident, $b:ident, $ty:ident) => {{
+                let a = $a as u32;
+                let b = $b as u32;
+                let borrow = !self.regs.p.c();
+                let c = a.wrapping_sub(b).wrapping_sub(borrow as u32);
+                let ovf = (a ^ b) & (a ^ c) & (1 << (<$ty>::BITS - 1)) != 0;
+
+                self.regs.p.set_c(c <= <$ty>::MAX as u32);
+                self.regs.p.set_v(ovf);
+
                 if self.regs.p.d() {
-                    // decimal
-                    todo!()
+                    let a = $a as i32;
+                    let b = $b as i32;
+                    let mut cl = (a & 0xF) - (b & 0xF) - borrow as i32;
+                    if cl < 0 {
+                        cl = ((cl - 6) & 0xF) - 0x10;
+                    }
+                    let mut c = (a & 0xF0) - (b & 0xF0) + cl;
+                    if c < 0 {
+                        c = (c - 0x60) & 0xFF - 0x100;
+                    }
+
+                    macro_rules! calc {
+                        (u8) => {};
+                        (u16) => {
+                            c = (a & 0xF00) - (b & 0xF00) + c;
+                            if c < 0 {
+                                c = (c - 0x600) & 0xFFF - 0x1000;
+                            }
+                            c = (a & 0xF000) - (b & 0xF000) + c;
+                            if c < 0 {
+                                c -= 0x6000;
+                            }
+                        };
+                    }
+
+                    calc!($ty);
+
+                    c as $ty
                 } else {
-                    let a = $a;
-                    let b = $b;
-                    let c = self.regs.p.c();
-
-                    let (ret, carry1) = a.overflowing_sub(b);
-                    let (ret, carry2) = ret.overflowing_sub((!c) as _);
-                    let ovf = Value::msb(&((a ^ b) & (a ^ ret)));
-
-                    self.regs.p.set_c(!(carry1 || carry2));
-                    self.regs.p.set_v(ovf);
-
-                    ret
+                    c as $ty
                 }
             }};
         }
@@ -848,7 +954,7 @@ impl Cpu {
 
         macro_rules! rmw_reg {
             ($op:ident, $reg:ident) => {{
-                if is_8bit!(self, a) {
+                if is_8bit!(self, $reg) {
                     let v = self.regs.$reg as u8;
                     set_reg!($reg, modop!($op, v, u8));
                 } else {
@@ -859,12 +965,12 @@ impl Cpu {
         }
 
         macro_rules! modop {
-            (inc, $v:ident, $_ty:ty) => {{
+            (inc, $v:ident, $_:ty) => {{
                 let v = $v.wrapping_add(1);
                 self.regs.set_nz(v);
                 v
             }};
-            (dec, $v:ident, $_ty:ty) => {{
+            (dec, $v:ident, $_:ty) => {{
                 let v = $v.wrapping_sub(1);
                 self.regs.set_nz(v);
                 v
@@ -882,13 +988,13 @@ impl Cpu {
                 self.regs.p.set_z(v & a == 0);
                 v & !a
             }};
-            (asl, $v:ident, $_ty:ty) => {{
-                let (v, ovf) = $v.overflowing_shl(1);
+            (asl, $v:ident, $ty:ty) => {{
+                let v = $v << 1;
                 self.regs.set_nz(v);
-                self.regs.p.set_c(ovf);
+                self.regs.p.set_c($v & (1 << (<$ty>::BITS - 1)) != 0);
                 v
             }};
-            (lsr, $v:ident, $_ty:ty) => {{
+            (lsr, $v:ident, $_:ty) => {{
                 let v = $v;
                 self.regs.p.set_c(v & 1 != 0);
                 let v = v >> 1;
@@ -896,18 +1002,17 @@ impl Cpu {
                 v
             }};
             (rol, $v:ident, $ty:ty) => {{
-                let v = $v;
-                let (v, ovf) = v.overflowing_shl(1);
-                let v = v | (self.regs.p.c() as $ty);
-                self.regs.p.set_c(ovf);
+                let c = self.regs.p.c();
+                let v = $v.rotate_left(1);
+                self.regs.p.set_c(v & 1 != 0);
+                let v = v & !1 | (c as $ty);
                 self.regs.set_nz(v);
                 v
             }};
             (ror, $v:ident, $ty:ty) => {{
                 let c = self.regs.p.c();
-                let v = $v;
-                self.regs.p.set_c(v & 1 != 0);
-                let v = (v >> 1) | (c as $ty).rotate_right(1);
+                self.regs.p.set_c($v & 1 != 0);
+                let v = ($v & !1 | c as $ty).rotate_right(1);
                 self.regs.set_nz(v);
                 v
             }};
@@ -1245,12 +1350,4 @@ impl Cpu {
         let asm = match_opcode!(opcode, disasm_instr);
         Some((bytes, asm))
     }
-}
-
-fn check_overflow<T: Value>(a: T, b: T, res: T) -> bool {
-    (a ^ res) & (b ^ res) & (T::from_u8(1_u8) << (<T as Value>::BITS - 1)) != T::from_u8(0)
-}
-
-fn add_wrapping_lo16(addr: u32, inc: u16) -> u32 {
-    addr & 0x00FF0000 | (addr as u16).wrapping_add(inc) as u32
 }

@@ -3,6 +3,7 @@
 use std::fmt::Display;
 
 use log::{debug, trace, warn, Level};
+use meru_interface::AudioBuffer;
 use modular_bitfield::prelude::*;
 use super_sabicom_macro::opcodes;
 
@@ -16,6 +17,8 @@ pub struct Spc {
     ioregs: IORegisters,
     ram: Vec<u8>,
     counter: u64,
+
+    audio_buffer: AudioBuffer,
 }
 
 impl Default for Spc {
@@ -25,6 +28,7 @@ impl Default for Spc {
             ioregs: IORegisters::default(),
             ram: vec![0; 0x10000],
             counter: 0,
+            audio_buffer: AudioBuffer::default(),
         }
     }
 }
@@ -129,6 +133,18 @@ impl Default for IORegisters {
 }
 
 impl Spc {
+    pub fn audio_buffer(&self) -> &AudioBuffer {
+        &self.audio_buffer
+    }
+
+    pub fn read_port(&self, port: u8) -> u8 {
+        self.ioregs.cpuout[port as usize]
+    }
+
+    pub fn write_port(&mut self, port: u8, data: u8) {
+        self.ioregs.cpuin[port as usize] = data;
+    }
+
     pub fn tick(&mut self, ctx: &mut impl Context) {
         let world = ctx.now() * 10240 / 214772;
         let start = self.counter;
@@ -1365,6 +1381,7 @@ impl SpcFile {
             ioregs: IORegisters::default(),
             ram: self.ram.clone(),
             counter: 0,
+            audio_buffer: AudioBuffer::default(),
         };
 
         for i in 0x00F1..=0x00FC {

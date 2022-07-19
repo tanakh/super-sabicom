@@ -10,13 +10,20 @@ edition = "2021"
 
 [dependencies]
 super-sabicom-macro = { path = "super-sabicom-macro", version = "0.1" }
+
+anyhow = "1.0.58"
 educe = { version = "0.4.19", features = ["Default"], default-features = false }
+egui = "0.18.1"
 log = "0.4.17"
+meru-interface = "0.1.0"
 modular-bitfield = "0.11.2"
+serde = "1.0.139"
 thiserror = "1.0.31"
 
 [dev-dependencies]
 anyhow = "1.0.58"
 argopt = "0.3.0"
 compress-tools = "0.12.3"
+dirs = "4.0.0"
 env_logger = "0.9.0"
+sdl2 = "0.35.2"
