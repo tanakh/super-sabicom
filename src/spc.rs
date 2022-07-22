@@ -242,7 +242,7 @@ impl Spc {
                 self.ram[addr as usize]
             }
         };
-        // trace!("Read: {addr:#06X} = {data:#04X}");
+        trace!("Read:  {addr:#06X} = {data:#04X}");
         data
     }
 
@@ -255,7 +255,7 @@ impl Spc {
     }
 
     fn write8(&mut self, addr: u16, data: u8) {
-        // trace!("Write: {addr:#06X} = {data:#04X}");
+        trace!("Write: {addr:#06X} = {data:#04X}");
         if self.ioregs.ram_write_enable {
             self.ram[addr as usize] = data;
         }
@@ -343,7 +343,7 @@ impl Spc {
             _ => todo!("IO Read: {addr:X}"),
         };
 
-        trace!("IO Read: {addr:X} = {data:#04X}");
+        trace!("IO Read:  {addr:X} = {data:#04X}");
         data
     }
 
@@ -670,13 +670,22 @@ impl Spc {
             }};
             (div ya, (reg x)) => {{
                 let ya = self.regs.ya();
-                let d = ya / self.regs.x as u16;
-                let m = ya % self.regs.x as u16;
-                self.regs.psw.set_v(d > 0xFF);
-                self.regs.set_nz(d as u8);
-                self.regs.a = d as u8;
-                self.regs.y = m as u8;
-                // FIXME: set H flag
+                if self.regs.x > 0 {
+                    let d = ya / self.regs.x as u16;
+                    let m = ya % self.regs.x as u16;
+                    self.regs.a = d as u8;
+                    self.regs.y = m as u8;
+                    // FIXME: set H flag
+                    self.regs.psw.set_v(d > 0xFF);
+                    self.regs.set_nz(d as u8);
+                } else {
+                    self.regs.a = 0xFF;
+                    self.regs.y = 0xFF;
+                    // FIXME: I don't know the exact behavior of flags.
+                    self.regs.psw.set_z(false);
+                    self.regs.psw.set_n(true);
+                    self.regs.psw.set_v(true);
+                }
                 elapse!(ram, 1);
                 elapse!(io, 10);
             }};
@@ -887,8 +896,9 @@ impl Spc {
                 self.regs.pc = addr!($addrmode)
             };
             (call $addrmode:tt) => {{
+                let addr = addr!($addrmode);
                 self.push16(self.regs.pc);
-                self.regs.pc = addr!($addrmode);
+                self.regs.pc = addr;
                 elapse!(io, 3);
             }};
             (tcall $i:expr) => {{
@@ -1032,7 +1042,6 @@ impl Spc {
                 self.regs.psw.set_c(!c);
             }};
             (adc, $op1:expr, $op2:expr) => {{
-                eprintln!("adc {:#04X} {:#04X}", $op1, $op2);
                 let op1 = $op1 as u32;
                 let op2 = $op2 as u32;
                 let v = op1 + op2 + self.regs.psw.c() as u32;
@@ -1240,7 +1249,7 @@ impl Spc {
         #[rustfmt::skip]
         macro_rules! opr {
             ($i:literal) => { $i };
-            (a) => { 'A' };
+            (a) => { 'a' };
             (x) => { 'x' };
             (y) => { 'y' };
             (sp) => { "sp" };

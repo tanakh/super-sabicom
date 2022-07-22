@@ -22,7 +22,9 @@ pub struct Ppu {
     bg_tile_base_addr: [u8; 4],
     bg_hofs: [u16; 4],
     bg_vofs: [u16; 4],
+    rot_setting: RotSetting,
     rot_param: RotParam,
+    mul_result: i32,
     win_mask: WinMask,
     win_pos: [WinPos; 2],
     win_logic: WinLogic,
@@ -52,6 +54,16 @@ pub struct Ppu {
     y: u32,
     frame: u64,
     counter: u64,
+    hblank: bool,
+    vblank: bool,
+    hdma_reload: bool,
+    hdma_transfer: bool,
+
+    h_latch: u32,
+    h_flipflop: bool,
+    v_latch: u32,
+    v_flipflop: bool,
+    hv_latched: bool,
 
     #[educe(Default(
         expression = "FrameBuffer::new(SCREEN_WIDTH.try_into().unwrap(), SCREEN_HEIGHT.try_into().unwrap())"
@@ -60,6 +72,10 @@ pub struct Ppu {
 
     #[educe(Default(expression = "vec![0; SCREEN_WIDTH.try_into().unwrap()]"))]
     line_buffer: Vec<u16>,
+    #[educe(Default(expression = "vec![0; SCREEN_WIDTH.try_into().unwrap()]"))]
+    line_buffer_sub: Vec<u16>,
+    #[educe(Default(expression = "vec![0; SCREEN_WIDTH.try_into().unwrap()]"))]
+    z_buffer: Vec<u8>,
 }
 
 #[bitfield(bits = 16)]
@@ -87,6 +103,16 @@ struct ObjSel {
     obj_size_sel: ObjSizeSel,
 }
 
+impl ObjSel {
+    fn addr_gap(&self) -> u16 {
+        self.obj_addr_gap() as u16 * 0x2000
+    }
+
+    fn tile_base_addr(&self) -> u16 {
+        self.obj_base_addr() as u16 * 0x4000
+    }
+}
+
 #[derive(BitfieldSpecifier)]
 #[bits = 3]
 enum ObjSizeSel {
@@ -99,7 +125,7 @@ enum ObjSizeSel {
 }
 
 impl ObjSizeSel {
-    fn size_small(&self) -> (u32, u32) {
+    fn size_small(&self) -> (usize, usize) {
         match self {
             ObjSizeSel::Size8x8_16x16 => (8, 8),
             ObjSizeSel::Size8x8_32x32 => (8, 8),
@@ -110,7 +136,7 @@ impl ObjSizeSel {
         }
     }
 
-    fn size_large(&self) -> (u32, u32) {
+    fn size_large(&self) -> (usize, usize) {
         match self {
             ObjSizeSel::Size8x8_16x16 => (16, 16),
             ObjSizeSel::Size8x8_32x32 => (32, 32),
@@ -167,7 +193,7 @@ struct OamAddr {
 }
 
 #[bitfield(bits = 8)]
-#[derive(Default)]
+#[derive(Default, Debug)]
 struct BgMode {
     mode: B3,
     bg3_priority_is_high: bool,
@@ -203,6 +229,16 @@ enum ScreenSize {
     VMirror = 1,
     HMirror = 2,
     FourScren = 3,
+}
+
+#[bitfield(bits = 8)]
+#[derive(Default)]
+struct RotSetting {
+    h_flip: bool,
+    v_flip: bool,
+    #[skip]
+    __: B4,
+    screen_over: B2, // 0, 1: wrap, 2: transparent, 3: filled by tile 0x00
 }
 
 #[derive(Default)]
@@ -367,10 +403,30 @@ impl Ppu {
     pub fn frame_buffer(&self) -> &FrameBuffer {
         &self.frame_buffer
     }
+
+    pub fn vblank(&self) -> bool {
+        self.vblank
+    }
+
+    pub fn hblank(&self) -> bool {
+        self.hblank
+    }
+
+    pub fn hdma_reload(&mut self) -> bool {
+        let ret = self.hdma_reload;
+        self.hdma_reload = false;
+        ret
+    }
+
+    pub fn hdma_transfer(&mut self) -> bool {
+        let ret = self.hdma_reload;
+        self.hdma_reload = false;
+        ret
+    }
 }
 
 impl Ppu {
-    pub fn tick(&mut self, ctx: &mut impl Context) {
+    pub fn tick(&mut self, ctx: &mut impl Context, render: bool) {
         let now = ctx.now();
 
         while self.counter + CYCLES_PER_DOT as u64 <= now {
@@ -381,8 +437,6 @@ impl Ppu {
                 self.x = 0;
                 self.y += 1;
 
-                debug!("Line: {}:{}", self.frame, self.y);
-
                 if self.y == LINES_PER_FRAME {
                     self.y = 0;
                     self.frame += 1;
@@ -390,24 +444,35 @@ impl Ppu {
 
                     // clear vblank flag, reset NMI flag
                     // TODO: clear vblank flag
-                    ctx.set_nmi_flag(false);
+                    self.vblank = false;
+                    ctx.interrupt_mut().set_nmi_flag(false);
                 }
 
+                debug!("Line: {}:{}", self.frame, self.y);
+
                 if self.y == VBLANK_START {
-                    // TODO: set vblank flag
+                    self.vblank = true;
                 }
             }
 
             // FIXME: x == 0.5, not 1
             if (self.x, self.y) == (1, VBLANK_START) {
-                ctx.set_nmi_flag(true);
+                ctx.interrupt_mut().set_nmi_flag(true);
             }
 
             if self.x == 1 {
-                // FIXME: clear hblank flag
+                self.hblank = false;
             }
 
-            if self.x == 22 {
+            if (self.x, self.y) == (6, 0) {
+                self.hdma_reload = true;
+            }
+
+            if (self.x, self.y) == (10, 225) {
+                self.oam_addr_internal = self.oam_addr.addr() << 1;
+            }
+
+            if render && self.x == 22 {
                 if (1..1 + SCREEN_HEIGHT).contains(&self.y) {
                     self.render_line(self.y - 1);
                     self.copy_line_buffer(self.y - 1);
@@ -415,17 +480,102 @@ impl Ppu {
             }
 
             if self.x == 274 {
-                // FIXME: set hblank flag
+                self.hblank = true;
             }
 
-            if self.x == 278 {
-                // TODO: perform HDMA transfers
+            if self.x == 278 && (0..=224).contains(&self.y) {
+                self.hdma_transfer = true;
+            }
+
+            let raise_irq = match ctx.interrupt().hvirq_enable() {
+                1 => self.x == (ctx.interrupt().h_count() as u32 + 4),
+                2 => self.x == 3 && self.y == ctx.interrupt().v_count() as u32,
+                3 => {
+                    self.x == (ctx.interrupt().h_count() as u32 + 4)
+                        && self.y == ctx.interrupt().v_count() as u32
+                }
+                _ => false,
+            };
+            if raise_irq {
+                ctx.interrupt_mut().set_irq(true);
             }
         }
     }
 
     pub fn read(&mut self, ctx: &mut impl Context, addr: u16) -> u8 {
-        todo!();
+        match addr {
+            // PPU Picture Processing Unit (Read-Only Ports)
+            // 0x2134 - MPYL    - "PPU1 Signed Multiply Result   (lower 8bit)"
+            // 0x2135 - MPYM    - "PPU1 Signed Multiply Result   (middle 8bit)"
+            // 0x2136 - MPYH    - "PPU1 Signed Multiply Result   (upper 8bit)"
+            0x2134 => self.mul_result as u8,
+            0x2135 => (self.mul_result >> 8) as u8,
+            0x2136 => (self.mul_result >> 16) as u8,
+            // 0x2137 - SLHV    - "PPU1 Latch H/V-Counter by Software (Read=Strobe)"
+            0x2137 => {
+                self.hv_latched = true;
+                self.h_latch = self.x;
+                self.v_latch = self.y;
+                // FIXME: open-bus
+                0
+            }
+            // 0x2138 - RDOAM   - "PPU1 OAM Data Read            (read-twice)"
+            // 0x2139 - RDVRAML - "PPU1 VRAM Data Read           (lower 8bits)"
+            // 0x213A - RDVRAMH - "PPU1 VRAM Data Read           (upper 8bits)"
+            // 0x213B - RDCGRAM - "PPU2 CGRAM Data Read (Palette)(read-twice)"
+            0x213B => {
+                let word = self.cgram[self.cgram_addr as usize / 2];
+                let ret = if self.cgram_addr & 1 == 0 {
+                    word as u8
+                } else {
+                    (word >> 8) as u8
+                };
+                self.cgram_addr = (self.cgram_addr + 1) & 0x1FF;
+                ret
+            }
+            // 0x213C - OPHCT   - "PPU2 Horizontal Counter Latch (read-twice)"
+            0x213C => {
+                self.hv_latched = false; // ??
+                self.h_flipflop = !self.h_flipflop;
+                if self.h_flipflop {
+                    self.h_latch as u8
+                } else {
+                    // FIXME: Bit 1-7 is open-bus
+                    (self.h_latch >> 8) as u8 & 1
+                }
+            }
+            // 0x213D - OPVCT   - "PPU2 Vertical Counter Latch   (read-twice)"
+            0x213D => {
+                self.hv_latched = false; // ??
+                self.v_flipflop = !self.v_flipflop;
+                if self.v_flipflop {
+                    self.v_latch as u8
+                } else {
+                    // FIXME: Bit 1-7 is open-bus
+                    (self.v_latch >> 8) as u8 & 1
+                }
+            }
+            // 0x213E - STAT77  - "PPU1 Status and PPU1 Version Number"
+            // 0x213F - STAT78  - "PPU2 Status and PPU2 Version Number"
+            0x213F => {
+                let mut ret = 0;
+
+                const PPU2_VERSION: u8 = 1;
+                const FRAME_RATE: u8 = 0; // 0: 60Hz, 1: 50Hz
+
+                ret |= PPU2_VERSION;
+                ret |= FRAME_RATE << 4;
+                // FIXME: 5 is open-bus
+                ret |= (self.hv_latched as u8) << 6;
+                ret |= ((self.frame & 1) as u8) << 7;
+
+                self.h_flipflop = false;
+                self.v_flipflop = false;
+
+                ret
+            }
+            _ => todo!("PPU Read: {addr:04X}"),
+        }
     }
 
     pub fn write(&mut self, ctx: &mut impl Context, addr: u16, data: u8) {
@@ -450,7 +600,10 @@ impl Ppu {
                 }
                 self.oam_addr_internal = (self.oam_addr_internal + 1) & 0x3FF;
             }
-            0x2105 => self.bg_mode.bytes[0] = data,
+            0x2105 => {
+                self.bg_mode.bytes[0] = data;
+                debug!("BG Mode: {:?}", self.bg_mode);
+            }
             0x2106 => self.mosaic.bytes[0] = data,
             0x2107..=0x210A => self.bg_sc[(addr - 0x2107) as usize].bytes[0] = data,
             0x210B..=0x210C => {
@@ -460,11 +613,11 @@ impl Ppu {
             }
             0x210D | 0x210F | 0x2111 | 0x2113 => {
                 let ix = (addr - 0x210D) as usize / 2;
-                self.bg_hofs[ix] = self.bg_hofs[ix].wrapping_shl(8) | data as u16;
+                self.bg_hofs[ix] = self.bg_hofs[ix] >> 8 | (data as u16) << 8;
             }
             0x210E | 0x2110 | 0x2112 | 0x2114 => {
                 let ix = (addr - 0x210E) as usize / 2;
-                self.bg_vofs[ix] = self.bg_vofs[ix].wrapping_shl(8) | data as u16;
+                self.bg_vofs[ix] = self.bg_vofs[ix] >> 8 | (data as u16) << 8;
             }
             0x2115 => self.vram_addr_inc_mode.bytes[0] = data,
             0x2116 => self.vram_addr = self.vram_addr & 0x7F00 | data as u16,
@@ -478,12 +631,19 @@ impl Ppu {
                         (self.vram_addr + self.vram_addr_inc_mode.inc_words()) & 0x7FFF;
                 }
             }
-            0x211B => self.rot_param.a = self.rot_param.a << 8 | data as u16,
-            0x211C => self.rot_param.b = self.rot_param.b << 8 | data as u16,
-            0x211D => self.rot_param.c = self.rot_param.c << 8 | data as u16,
-            0x211E => self.rot_param.d = self.rot_param.d << 8 | data as u16,
-            0x211F => self.rot_param.x = self.rot_param.x << 8 | data as u16,
-            0x2120 => self.rot_param.y = self.rot_param.y << 8 | data as u16,
+            0x211A => self.rot_setting.bytes[0] = data,
+            0x211B => {
+                self.rot_param.a = self.rot_param.a >> 8 | (data as u16) << 8;
+                self.mul_result = self.rot_param.a as i16 as i32 * self.rot_param.b as i8 as i32;
+            }
+            0x211C => {
+                self.rot_param.b = self.rot_param.b >> 8 | (data as u16) << 8;
+                self.mul_result = self.rot_param.a as i16 as i32 * self.rot_param.b as i8 as i32;
+            }
+            0x211D => self.rot_param.c = self.rot_param.c >> 8 | (data as u16) << 8,
+            0x211E => self.rot_param.d = self.rot_param.d >> 8 | (data as u16) << 8,
+            0x211F => self.rot_param.x = self.rot_param.x >> 8 | (data as u16) << 8,
+            0x2120 => self.rot_param.y = self.rot_param.y >> 8 | (data as u16) << 8,
             0x2121 => self.cgram_addr = data as u16 * 2,
             0x2122 => {
                 debug!("CGRAM: {:03X} = {data:02X}", self.cgram_addr);
@@ -546,6 +706,17 @@ struct BgMapEntry {
     y_flip: bool,
 }
 
+#[bitfield(bits = 32)]
+struct ObjEntry {
+    x: u8,
+    y: u8,
+    tile_num: B9,
+    pal_num: B3,
+    priority: B2,
+    x_flip: bool,
+    y_flip: bool,
+}
+
 impl Ppu {
     fn render_line(&mut self, y: u32) {
         if self.display_ctrl.force_blank() {
@@ -555,24 +726,46 @@ impl Ppu {
 
         // Backdrop
         self.line_buffer.fill(self.cgram[0]);
+        self.z_buffer.fill(0xFF);
+
+        //     Mode0    Mode1    Mode2    Mode3    Mode4    Mode5    Mode6    Mode7
+        // 0:  -        BG3.1a   -        -        -        -        -        -
+        // 1:  OBJ.3    OBJ.3    OBJ.3    OBJ.3    OBJ.3    OBJ.3    OBJ.3    OBJ.3
+        // 2:  BG1.1    BG1.1    BG1.1    BG1.1    BG1.1    BG1.1    BG1.1    -
+        // 3:  BG2.1    BG2.1    -        -        -        -        -        -
+        // 4:  OBJ.2    OBJ.2    OBJ.2    OBJ.2    OBJ.2    OBJ.2    OBJ.2    OBJ.2
+        // 5:  BG1.0    BG1.0    BG2.1    BG2.1    BG2.1    BG2.1    -        BG2.1p
+        // 6:  BG2.0    BG2.0    -        -        -        -        -        -
+        // 7:  OBJ.1    OBJ.1    OBJ.1    OBJ.1    OBJ.1    OBJ.1    OBJ.1    OBJ.1
+        // 8:  BG3.1    BG3.1b   BG1.0    BG1.0    BG1.0    BG1.0    BG1.0    BG1
+        // 9:  BG4.1    -        -        -        -        -        -        -
+        // 10: OBJ.0    OBJ.0    OBJ.0    OBJ.0    OBJ.0    OBJ.0    OBJ.0    OBJ.0
+        // 11: BG3.0    BG3.0a   BG2.0    BG2.0    BG2.0    BG2.0    -        BG2.0p
+        // 12: BG4.0    BG3.0b   -        -        -        -        -        -
+        // FF: Backdrop Backdrop Backdrop Backdrop Backdrop Backdrop Backdrop Backdrop
 
         match self.bg_mode.mode() {
             0 => {
-                for i in 0..4 {
-                    self.render_bg(y, i, ColorMode::Color4);
-                }
+                self.render_bg(y, 0, 2, 5, 2);
+                self.render_bg(y, 1, 2, 6, 3);
+                self.render_bg(y, 2, 2, 11, 8);
+                self.render_bg(y, 3, 2, 12, 9);
             }
-            1 => todo!("BG Mode 1"),
+            1 => {
+                self.render_bg(y, 0, 4, 5, 2);
+                self.render_bg(y, 1, 4, 6, 3);
+                self.render_bg(y, 2, 2, 11, 0); // FIXME
+            }
             2 => todo!("BG Mode 2"),
             3 => todo!("BG Mode 3"),
             4 => todo!("BG Mode 4"),
             5 => todo!("BG Mode 5"),
             6 => todo!("BG Mode 6"),
-            7 => todo!("BG Mode 7"),
+            7 => log::warn!("BG Mode 7"),
             _ => unreachable!(),
         }
 
-        // Obj
+        self.render_obj(y);
 
         // todo!()
     }
@@ -584,17 +777,13 @@ impl Ppu {
         }
     }
 
-    fn render_bg(&mut self, y: u32, i: usize, mode: ColorMode) {
+    fn render_bg(&mut self, y: u32, i: usize, bpp: usize, zl: u8, zh: u8) {
         if !self.screen_desig_main.bg(i) {
             return;
         }
 
         if self.bg_mode.tile_size(i) {
             todo!("16 x 16 Tile mode");
-        }
-
-        if !matches!(mode, ColorMode::Color4) {
-            todo!("Not 4-color mode");
         }
 
         if y == 0 {
@@ -613,12 +802,6 @@ impl Ppu {
         // TODO: mosaic
         // TODO: window
 
-        let bpp = match mode {
-            ColorMode::Color4 => 2,
-            ColorMode::Color16 => 4,
-            ColorMode::Color256 => 8,
-        };
-
         let pal_size = 1 << bpp;
 
         let (sc_w, sc_h) = match sc_size {
@@ -628,12 +811,13 @@ impl Ppu {
             ScreenSize::FourScren => (2, 2),
         };
 
-        let sy = y as usize + hofs;
+        let sy = y as usize + vofs;
 
         const SC_SIZE: usize = 32 * 32 * 2;
 
+        // FIXME: optimize
         for x in 0..SCREEN_WIDTH {
-            let sx = x as usize + vofs;
+            let sx = x as usize + hofs;
             let sc_x = sx / 8 / 32 % sc_w;
             let sc_y = sy / 8 / 32 % sc_h;
             let tile_x = sx / 8 % 32;
@@ -652,10 +836,10 @@ impl Ppu {
             let entry =
                 BgMapEntry::from_bytes(self.vram[entry_addr..entry_addr + 2].try_into().unwrap());
 
+            let z = if entry.priority() == 0 { zl } else { zh };
+
             let pixel_x = if entry.x_flip() { pixel_x } else { 7 - pixel_x };
             let pixel_y = if entry.y_flip() { 7 - pixel_y } else { pixel_y };
-
-            // TODO: Priority
 
             let tile_addr = tile_base_addr + entry.char_num() as usize * bpp as usize * 8;
 
@@ -667,9 +851,85 @@ impl Ppu {
                 pixel |= ((b0 >> pixel_x) & 1) | (((b1 >> pixel_x) & 1) << 1) << (i * 2);
             }
 
-            if pixel != 0 {
+            if pixel != 0 && z < self.z_buffer[x as usize] {
                 let col = self.cgram[entry.pal_num() as usize * pal_size + pixel as usize];
                 self.line_buffer[x as usize] = col;
+                self.z_buffer[x as usize] = z;
+            }
+        }
+    }
+
+    fn render_obj(&mut self, y: u32) {
+        if !self.screen_desig_main.obj() {
+            return;
+        }
+
+        let y = y as usize;
+
+        const OBJ_Z_TABLE: [u8; 4] = [10, 7, 4, 1];
+        const BPP: usize = 4;
+        const PAL_SIZE: usize = 16;
+
+        let tile_base_addr = self.obj_sel.tile_base_addr() as usize;
+        let addr_gap = self.obj_sel.addr_gap() as usize;
+
+        let sizes = [
+            self.obj_sel.obj_size_sel().size_small(),
+            self.obj_sel.obj_size_sel().size_large(),
+        ];
+
+        for i in 0..128 {
+            let entry = ObjEntry::from_bytes(self.oam[i * 4..i * 4 + 4].try_into().unwrap());
+            let extra = (self.oam[0x200 + i / 4] >> ((i & 3) * 2)) & 3;
+
+            let (ow, oh) = sizes[(extra >> 1) as usize];
+            let oy = entry.y() as usize;
+            if !(oy..oy + oh).contains(&y) {
+                continue;
+            }
+            let ox = ((extra as usize & 1) << 8) + entry.x() as usize;
+            let dy = y - oy;
+            let pixel_y = if !entry.y_flip() { dy } else { oh - 1 - dy };
+
+            let z = OBJ_Z_TABLE[entry.priority() as usize];
+
+            log::info!(
+                "Render OBJ {i}: ({ox}, {oy}), tile num: {}",
+                entry.tile_num()
+            );
+
+            let tile_num = entry.tile_num() as usize;
+            let tile_num = tile_num & 0x10F | ((tile_num & 0xF0) + pixel_y / 8 * 16) & 0xF0;
+
+            for dx in 0..ow {
+                let x = ox + dx;
+                if !(0..SCREEN_WIDTH as usize).contains(&x) {
+                    continue;
+                }
+                let pixel_x = if !entry.x_flip() { dx } else { ow - 1 - dx } as usize;
+
+                let tile_num = tile_num & 0x1F0 | ((tile_num & 0xF) + pixel_x / 8) & 0xF;
+                let tile_addr = if tile_num & 0x100 == 0 {
+                    tile_base_addr + tile_num as usize * BPP * 8
+                } else {
+                    tile_base_addr + addr_gap + (tile_num as usize & 0xFF) * BPP * 8
+                };
+
+                let mut pixel = 0;
+                for i in 0..BPP / 2 {
+                    let addr = tile_addr + i * 16 + pixel_y % 8 * 2;
+                    let b0 = self.vram[addr];
+                    let b1 = self.vram[addr + 1];
+                    pixel |= ((b0 >> (7 - pixel_x % 8)) & 1) << (i * 2);
+                    pixel |= ((b1 >> (7 - pixel_x % 8)) & 1) << (i * 2 + 1);
+                }
+
+                if pixel != 0 && z < self.z_buffer[x as usize] {
+                    let col =
+                        self.cgram[0x80 + entry.pal_num() as usize * PAL_SIZE + pixel as usize];
+                    self.line_buffer[x as usize] = col;
+                    self.z_buffer[x as usize] = z;
+                }
             }
         }
     }

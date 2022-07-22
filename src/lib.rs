@@ -83,9 +83,9 @@ impl EmulatorCore for Snes {
 
         while start_frame == self.ctx.ppu().frame() {
             self.ctx.exec_one();
-            self.ctx.bus_tick();
-            self.ctx.ppu_tick();
+            self.ctx.ppu_tick(render_graphics);
             self.ctx.spc_tick();
+            self.ctx.bus_tick();
         }
     }
 
@@ -108,7 +108,8 @@ impl EmulatorCore for Snes {
     }
 
     fn set_input(&mut self, input: &meru_interface::InputData) {
-        // TODO
+        use context::Bus;
+        self.ctx.bus_mut().set_input(input);
     }
 
     fn backup(&self) -> Option<Vec<u8>> {

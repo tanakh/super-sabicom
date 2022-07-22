@@ -3,7 +3,7 @@
 use std::ops::{BitAnd, BitXor, Shl};
 
 use crate::context;
-use log::{debug, trace};
+use log::{debug, error, trace};
 use modular_bitfield::prelude::*;
 use super_sabicom_macro::opcodes;
 
@@ -114,28 +114,58 @@ impl Registers {
         (self.pb as u32) << 16 | self.pc as u32
     }
 
+    fn set_p(&mut self, val: u8) {
+        self.p = val.into();
+
+        if self.e {
+            self.p.set_m(true);
+            self.p.set_x(true);
+        }
+
+        if self.p.x() {
+            self.x &= 0xFF;
+            self.y &= 0xFF;
+        }
+    }
+
+    fn set_e(&mut self, val: bool) {
+        self.e = val;
+        if self.e {
+            self.p.set_x(true);
+            self.p.set_m(true);
+            self.x &= 0xFF;
+            self.y &= 0xFF;
+            self.s = 0x100 | self.s & 0xFF;
+        }
+    }
+
     #[inline]
     fn set_nz(&mut self, val: impl Value) {
         self.p.set_z(val.zero());
         self.p.set_n(val.msb());
     }
 
+    #[inline]
     fn set_a(&mut self, val: impl Value) {
         self.a = val.set(self.a);
     }
 
+    #[inline]
     fn set_x(&mut self, val: impl Value) {
         self.x = val.get();
     }
 
+    #[inline]
     fn set_y(&mut self, val: impl Value) {
         self.y = val.get();
     }
 
-    fn set_s(&mut self, val: impl Value) {
-        self.s = val.get();
-    }
+    // #[inline]
+    // fn set_s(&mut self, val: impl Value) {
+    //     self.s = val.get();
+    // }
 
+    #[inline]
     fn set_d(&mut self, val: impl Value) {
         self.d = val.get();
     }
@@ -321,17 +351,16 @@ impl Cpu {
 
     fn push8(&mut self, ctx: &mut impl Context, data: u8) {
         ctx.write(self.regs.s as u32, data);
-        self.regs.s = self.regs.s.wrapping_sub(1);
+        if !self.regs.e {
+            self.regs.s = self.regs.s.wrapping_sub(1);
+        } else {
+            self.regs.s = self.regs.s & 0xFF00 | (self.regs.s as u8).wrapping_sub(1) as u16;
+        }
     }
     fn push16(&mut self, ctx: &mut impl Context, data: u16) {
         self.push8(ctx, (data >> 8) as u8);
         self.push8(ctx, data as u8);
     }
-    // fn push24(&mut self, ctx: &mut impl Context, data: u32) {
-    //     self.push8(ctx, (data >> 16) as u8);
-    //     self.push8(ctx, (data >> 8) as u8);
-    //     self.push8(ctx, data as u8);
-    // }
 
     fn pop8(&mut self, ctx: &mut impl Context) -> u8 {
         self.regs.s = self.regs.s.wrapping_add(1);
@@ -342,12 +371,6 @@ impl Cpu {
         let b1 = self.pop8(ctx);
         (b0 as u16) | ((b1 as u16) << 8)
     }
-    // fn pop24(&mut self, ctx: &mut impl Context) -> u32 {
-    //     let b0 = self.pop8(ctx);
-    //     let b1 = self.pop8(ctx);
-    //     let b2 = self.pop8(ctx);
-    //     (b0 as u32) | ((b1 as u32) << 8) | ((b2 as u32) << 16)
-    // }
 
     fn exception(&mut self, ctx: &mut impl Context, e: Exception) {
         debug!("Exception: {e:?}");
@@ -355,17 +378,16 @@ impl Cpu {
         self.halt = false;
         ctx.elapse(INTERNAL_CYCLE * 2);
 
+        let mut p = self.regs.p;
         if self.regs.e {
-            // set B (X) flag
-            self.regs
-                .p
-                .set_x(matches!(e, Exception::Brk | Exception::Cop));
+            // set B (X) flag on BRK or COP
+            p.set_x(matches!(e, Exception::Brk | Exception::Cop));
         }
         self.push16(ctx, self.regs.pc);
         if !self.regs.e {
             self.push8(ctx, self.regs.pb);
         }
-        self.push8(ctx, self.regs.p.into());
+        self.push8(ctx, p.into());
 
         self.regs.p.set_d(false);
         self.regs.p.set_i(true);
@@ -373,7 +395,41 @@ impl Cpu {
         self.regs.pc = read16(ctx, e.vector_addr(self.regs.e) as u32);
     }
 
+    fn check_invaliant(&self) -> bool {
+        if self.regs.e {
+            if !self.regs.p.x() {
+                error!("X flag is not set in Emulation mode");
+                return false;
+            }
+            if !self.regs.p.m() {
+                error!("M flag is not set in Emulation mode");
+                return false;
+            }
+            if self.regs.s & 0xFF00 != 0x0100 {
+                error!("S register's msb is not 0x0100 in Emulation mode");
+                return false;
+            }
+        }
+        if self.regs.p.x() {
+            if self.regs.x & 0xFF00 != 0 {
+                error!("X register's msb is not zero when M flag is set");
+                return false;
+            }
+            if self.regs.y & 0xFF00 != 0 {
+                error!("Y register's msb is not zero when M flag is set");
+                return false;
+            }
+        }
+        true
+    }
+
     pub fn exec_one(&mut self, ctx: &mut impl Context) {
+        // FIXME: delete this when stable
+        if !self.check_invaliant() {
+            self.trace(ctx);
+            panic!("Consistency check failed at cycle = {}", ctx.now());
+        }
+
         if ctx.bus().locked() {
             return;
         }
@@ -383,12 +439,12 @@ impl Cpu {
             return;
         }
 
-        if ctx.nmi() {
+        if ctx.interrupt_mut().nmi() {
             self.exception(ctx, Exception::Nmi);
             return;
         }
 
-        if (self.halt || !self.regs.p.i()) && ctx.irq() {
+        if (self.halt || !self.regs.p.i()) && ctx.interrupt().irq() {
             self.exception(ctx, Exception::Irq);
             return;
         }
@@ -455,14 +511,9 @@ impl Cpu {
             };
 
             // push
-            (push p) => {{
-                let mut p = self.regs.p;
-                if self.regs.e {
-                    p.set_m(true);
-                    p.set_x(true);
-                }
-                self.push8(ctx, p.into());
-            }};
+            (push p) => {
+                self.push8(ctx, self.regs.p.into())
+            };
             (push pb) => {
                 self.push8(ctx, self.regs.pb)
             };
@@ -491,11 +542,8 @@ impl Cpu {
 
             // pop
             (pop p) => {{
-                self.regs.p = self.pop8(ctx).into();
-                if self.regs.e {
-                    self.regs.p.set_x(true);
-                    self.regs.p.set_m(true);
-                }
+                let p = self.pop8(ctx);
+                self.regs.set_p(p);
             }};
             (pop db) => {{
                 let v = self.pop8(ctx);
@@ -616,36 +664,32 @@ impl Cpu {
                 self.regs.pc = addr as u16;
             }};
 
-            (jsr abs) => {{
-                let addr = self.fetch16(ctx);
-                self.push16(ctx, self.regs.pc);
-                self.regs.pc = addr;
-            }};
             (jsr far) => {{
                 let addr = self.fetch24(ctx);
-                self.push16(ctx, self.regs.pc);
                 self.push8(ctx, self.regs.pb);
-                self.regs.pc = addr as u16;
+                self.push16(ctx, self.regs.pc.wrapping_sub(1));
                 self.regs.pb = (addr >> 16) as u8;
+                self.regs.pc = addr as u16;
             }};
-            (jsr aix) => {{
-                let addr = addr!(aix);
-                self.push16(ctx, self.regs.pc);
+            (jsr $addr:ident) => {{
+                let addr = addr!($addr);
+                self.push16(ctx, self.regs.pc.wrapping_sub(1));
                 self.regs.pc = addr as u16;
             }};
 
             (rti) => {{
                 // FIXME: RTI cannot modify the B-Flag or the unused flag.
-                self.regs.p = self.pop8(ctx).into();
+                let p = self.pop8(ctx);
+                self.regs.set_p(p);
                 self.regs.pb = self.pop8(ctx);
                 self.regs.pc = self.pop16(ctx);
             }};
             (rtl) => {{
+                self.regs.pc = self.pop16(ctx).wrapping_add(1);
                 self.regs.pb = self.pop8(ctx);
-                self.regs.pc = self.pop16(ctx);
             }};
             (rts) => {{
-                self.regs.pc = self.pop16(ctx);
+                self.regs.pc = self.pop16(ctx).wrapping_add(1);
             }};
 
             // cond branch
@@ -707,28 +751,18 @@ impl Cpu {
             };
             (rep imm) => {{
                 let v = self.fetch8(ctx);
-                let mut p: Status = (u8::from(self.regs.p) & !v).into();
-                if self.regs.e {
-                    p.set_x(true);
-                    p.set_m(true);
-                }
-                self.regs.p = p;
+                let p = u8::from(self.regs.p) & !v;
+                self.regs.set_p(p);
             }};
             (sep imm) => {{
                 let v = self.fetch8(ctx);
-                self.regs.p = (u8::from(self.regs.p) | v).into();
+                let p = u8::from(self.regs.p) | v;
+                self.regs.set_p(p);
             }};
             (xce) => {{
                 let c = self.regs.p.c();
                 self.regs.p.set_c(self.regs.e);
-                self.regs.e = c;
-                if self.regs.e {
-                    self.regs.p.set_x(true);
-                    self.regs.p.set_m(true);
-                    self.regs.x &= 0xFF;
-                    self.regs.y &= 0xFF;
-                    self.regs.s = 0x100 | self.regs.s & 0xFF;
-                }
+                self.regs.set_e(c);
             }};
 
             // special
@@ -1169,8 +1203,9 @@ impl Cpu {
             },
         );
 
+        use crate::consts::*;
         trace!(
-            "{:02X}:{:04X}  {asm:32} A:{:04X} X:{:04X} Y:{:04X} S:{:04X} D:{:04X} DB:{:02X} PB:{:02X} P:{}{}{}{}{}{}{}{}{} CYC: {}",
+            "{:02X}:{:04X}  {asm:32} A:{:04X} X:{:04X} Y:{:04X} S:{:04X} D:{:04X} DB:{:02X} PB:{:02X} P:{}{}{}{}{}{}{}{}{} @{frame}:{y:03}:{x:03}.{frac}",
             self.regs.pb,
             self.regs.pc,
             self.regs.a,
@@ -1189,7 +1224,10 @@ impl Cpu {
             if self.regs.p.i() {'I'} else {'i'},
             if self.regs.p.z() {'Z'} else {'z'},
             if self.regs.p.c() {'C'} else {'c'},
-            ctx.now(),
+            frame = ctx.now() / CYCLES_PER_DOT as u64 / DOTS_PER_LINE as u64 / LINES_PER_FRAME as u64,
+            y = ctx.now() / CYCLES_PER_DOT as u64 / DOTS_PER_LINE as u64 % LINES_PER_FRAME as u64,
+            x = ctx.now() / CYCLES_PER_DOT as u64 % DOTS_PER_LINE as u64,
+            frac = ctx.now() % CYCLES_PER_DOT as u64,
         );
     }
 

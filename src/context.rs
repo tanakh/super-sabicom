@@ -25,7 +25,7 @@ pub trait Ppu {
 
     fn ppu_read(&mut self, addr: u16) -> u8;
     fn ppu_write(&mut self, addr: u16, data: u8);
-    fn ppu_tick(&mut self);
+    fn ppu_tick(&mut self, render: bool);
 }
 
 #[delegate]
@@ -44,13 +44,8 @@ pub trait Rom {
 
 #[delegate]
 pub trait Interrupt {
-    fn set_nmi_enable(&mut self, enable: bool);
-    fn nmi_flag(&mut self) -> bool;
-    fn set_nmi_flag(&mut self, nmi: bool);
-    fn nmi(&mut self) -> bool;
-
-    fn set_irq(&mut self, irq: bool);
-    fn irq(&self) -> bool;
+    fn interrupt(&self) -> &InterruptCtrl;
+    fn interrupt_mut(&mut self) -> &mut InterruptCtrl;
 }
 
 #[delegate]
@@ -72,11 +67,84 @@ pub struct Context {
     rom: rom::Rom,
 
     #[split(Inner3: Interrupt + Timing)]
+    interrupt: InterruptCtrl,
     counter: u64,
+}
+
+#[derive(Default)]
+pub struct InterruptCtrl {
     nmi_enable: bool,
     nmi_flag: bool,
     nmi: bool,
+    hvirq_enable: u8,
+    h_count: u16,
+    v_count: u16,
     irq: bool,
+}
+
+impl InterruptCtrl {
+    pub fn set_nmi_enable(&mut self, enable: bool) {
+        let prev = self.nmi_enable && self.nmi_flag;
+        self.nmi_enable = enable;
+        if !prev && self.nmi_enable && self.nmi_flag {
+            self.nmi = true;
+        }
+    }
+
+    pub fn nmi_flag(&mut self) -> bool {
+        let ret = self.nmi_flag;
+        self.nmi_flag = false;
+        ret
+    }
+
+    pub fn set_nmi_flag(&mut self, nmi: bool) {
+        let prev = self.nmi_enable && self.nmi_flag;
+        self.nmi_flag = nmi;
+        if !prev && self.nmi_enable && self.nmi_flag {
+            self.nmi = true;
+        }
+    }
+
+    pub fn nmi(&mut self) -> bool {
+        let ret = self.nmi;
+        self.nmi = false;
+        ret
+    }
+
+    pub fn hvirq_enable(&self) -> u8 {
+        self.hvirq_enable
+    }
+
+    pub fn set_hvirq_enable(&mut self, enable: u8) {
+        self.hvirq_enable = enable;
+        if enable == 0 {
+            self.irq = false;
+        }
+    }
+
+    pub fn h_count(&self) -> u16 {
+        self.h_count
+    }
+
+    pub fn set_h_count(&mut self, h_count: u16) {
+        self.h_count = h_count;
+    }
+
+    pub fn v_count(&self) -> u16 {
+        self.v_count
+    }
+
+    pub fn set_v_count(&mut self, v_count: u16) {
+        self.v_count = v_count;
+    }
+
+    pub fn set_irq(&mut self, irq: bool) {
+        self.irq = irq;
+    }
+
+    pub fn irq(&self) -> bool {
+        self.irq
+    }
 }
 
 impl Context {
@@ -86,7 +154,7 @@ impl Context {
         let ppu = ppu::Ppu::default();
         let spc = spc::Spc::default();
 
-        let mut ret = Self::new(cpu, bus, ppu, spc, rom, 0, false, false, false, false);
+        let mut ret = Self::new(cpu, bus, ppu, spc, rom, Default::default(), 0);
         ret.reset();
 
         ret
@@ -144,8 +212,8 @@ impl Ppu for Inner2 {
         self.ppu.write(&mut self.inner, addr, data)
     }
 
-    fn ppu_tick(&mut self) {
-        self.ppu.tick(&mut self.inner)
+    fn ppu_tick(&mut self, render: bool) {
+        self.ppu.tick(&mut self.inner, render)
     }
 }
 
@@ -172,40 +240,11 @@ impl Rom for Inner2 {
 }
 
 impl Interrupt for Inner3 {
-    fn set_nmi_enable(&mut self, enable: bool) {
-        let prev = self.nmi_enable && self.nmi_flag;
-        self.nmi_enable = enable;
-        if !prev && self.nmi_enable && self.nmi_flag {
-            self.nmi = true;
-        }
+    fn interrupt(&self) -> &InterruptCtrl {
+        &self.interrupt
     }
-
-    fn nmi_flag(&mut self) -> bool {
-        let ret = self.nmi_flag;
-        self.nmi_flag = false;
-        ret
-    }
-
-    fn set_nmi_flag(&mut self, nmi: bool) {
-        let prev = self.nmi_enable && self.nmi_flag;
-        self.nmi_flag = nmi;
-        if !prev && self.nmi_enable && self.nmi_flag {
-            self.nmi = true;
-        }
-    }
-
-    fn nmi(&mut self) -> bool {
-        let ret = self.nmi;
-        self.nmi = false;
-        ret
-    }
-
-    fn set_irq(&mut self, irq: bool) {
-        self.irq = irq;
-    }
-
-    fn irq(&self) -> bool {
-        self.irq
+    fn interrupt_mut(&mut self) -> &mut InterruptCtrl {
+        &mut self.interrupt
     }
 }
 
