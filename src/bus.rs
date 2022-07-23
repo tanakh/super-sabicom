@@ -466,8 +466,14 @@ impl Bus {
                 self.v_count = self.v_count & 0x00FF | ((data as u16) << 8);
                 ctx.interrupt_mut().set_v_count(self.v_count);
             }
-            0x420B => self.gdma_enable = data,
-            0x420C => self.hdma_enable = data,
+            0x420B => {
+                self.gdma_enable = data;
+                info!("GDMA Enable: {data:08b}");
+            }
+            0x420C => {
+                self.hdma_enable = data;
+                info!("HDMA Enable: {data:08b}");
+            }
             0x420D => self.ws2_access_cycle = if data & 1 == 0 { 8 } else { 6 },
 
             // CPU DMA, For below ports, x = Channel number 0..7 (R/W)
@@ -590,6 +596,7 @@ impl Bus {
     }
 
     fn hdma_reload(&mut self, ctx: &mut impl Context, ch: usize) {
+        self.locked = true;
         self.dma[ch].hdma_done_transfer = false;
 
         self.dma[ch].hdma_cur_addr = self.dma[ch].cur_addr;
@@ -609,6 +616,11 @@ impl Bus {
         }
 
         self.dma[ch].hdma_do_transfer = true;
+
+        info!(
+            "HDMA {ch} Reload: Line counter: {:02X}, addr: {:04X} -> 21{:02X}",
+            self.dma[ch].hdma_line_counter, self.dma[ch].hdma_cur_addr, self.dma[ch].iobus_addr,
+        );
     }
 
     fn hdma_exec(&mut self, ctx: &mut impl Context, ch: usize) {
@@ -617,6 +629,8 @@ impl Bus {
         }
 
         if self.dma[ch].hdma_do_transfer {
+            info!("HDMA Do trans");
+
             let transfer_unit = self.dma[ch].transfer_unit();
 
             for i in 0..transfer_unit.len() {
@@ -627,31 +641,45 @@ impl Bus {
                 let dst_addr =
                     0x2100 | self.dma[ch].iobus_addr.wrapping_add(transfer_unit[i] as u8) as u32;
 
-                debug!("HDMA: {src_addr:06X} -> {dst_addr:04X}");
+                info!("HDMA: {src_addr:06X} -> {dst_addr:04X}");
 
                 let data = self.read(ctx, src_addr);
                 self.write(ctx, dst_addr, data);
+                self.locked = true;
             }
         }
 
         self.dma[ch].hdma_line_counter -= 1;
         self.dma[ch].hdma_do_transfer = self.dma[ch].hdma_line_counter & 0x80 != 0;
 
-        if self.dma[ch].hdma_line_counter == 0 {
+        info!(
+            "HDMA: Line counter: {:02X}, Do transfer: {}",
+            self.dma[ch].hdma_line_counter, self.dma[ch].hdma_do_transfer
+        );
+
+        if self.dma[ch].hdma_line_counter & 0x7F == 0 {
             let addr = self.dma[ch].hdma_addr(1);
             let data = self.read(ctx, addr);
             self.dma[ch].hdma_line_counter = data;
+            self.locked = true;
+
+            info!(
+                "HDMA: New line counter: {:02X}",
+                self.dma[ch].hdma_line_counter
+            );
 
             if matches!(self.dma[ch].param.addr_mode(), DmaAddrMode::Indirect) {
                 if self.dma[ch].hdma_line_counter != 0 {
                     let addr = self.dma[ch].hdma_addr(2);
                     self.dma[ch].byte_count_or_indirect_hdma_addr = self.read16(ctx, addr);
                 } else {
+                    // Odd behavior: if the line counter is 0, only 1 byte read and it is placed in MSB
                     let addr = self.dma[ch].hdma_addr(1);
                     self.dma[ch].byte_count_or_indirect_hdma_addr =
                         (self.read(ctx, addr) as u16) << 8;
                 }
             }
+
             if self.dma[ch].hdma_line_counter == 0 {
                 self.dma[ch].hdma_done_transfer = true;
             } else {

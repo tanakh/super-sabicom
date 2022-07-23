@@ -33,7 +33,7 @@ pub struct Ppu {
     win_disable_main: ScreenDesig,
     win_disable_sub: ScreenDesig,
     color_math_ctrl: ColorMathCtrl,
-    color_math_data: ColorMathData,
+    sub_backdrop: Rgb555,
 
     #[educe(Default(expression = "vec![0; 0x10000]"))]
     vram: Vec<u8>,
@@ -71,11 +71,41 @@ pub struct Ppu {
     frame_buffer: FrameBuffer,
 
     #[educe(Default(expression = "vec![0; SCREEN_WIDTH.try_into().unwrap()]"))]
-    line_buffer: Vec<u16>,
+    line_buffer_main: Vec<u16>,
     #[educe(Default(expression = "vec![0; SCREEN_WIDTH.try_into().unwrap()]"))]
     line_buffer_sub: Vec<u16>,
     #[educe(Default(expression = "vec![0; SCREEN_WIDTH.try_into().unwrap()]"))]
-    z_buffer: Vec<u8>,
+    z_buffer_main: Vec<u8>,
+    #[educe(Default(expression = "vec![0; SCREEN_WIDTH.try_into().unwrap()]"))]
+    z_buffer_sub: Vec<u8>,
+}
+
+#[bitfield(bits = 16)]
+#[derive(Default, Clone, Copy)]
+#[repr(u16)]
+struct Rgb555 {
+    r: B5,
+    g: B5,
+    b: B5,
+    unused: B1,
+}
+
+impl Rgb555 {
+    #[inline]
+    fn blend<const ADD: bool, const HALF: bool>(&self, rhs: Self) -> Self {
+        use std::cmp::min;
+        if ADD {
+            let r = min(0x1F, (self.r() + rhs.r()) / if HALF { 2 } else { 1 });
+            let g = min(0x1F, (self.g() + rhs.g()) / if HALF { 2 } else { 1 });
+            let b = min(0x1F, (self.b() + rhs.b()) / if HALF { 2 } else { 1 });
+            Self::new().with_r(r).with_g(g).with_b(b)
+        } else {
+            let r = (self.r().saturating_sub(rhs.r())) / if HALF { 2 } else { 1 };
+            let g = (self.g().saturating_sub(rhs.g())) / if HALF { 2 } else { 1 };
+            let b = (self.b().saturating_sub(rhs.b())) / if HALF { 2 } else { 1 };
+            Self::new().with_r(r).with_g(g).with_b(b)
+        }
+    }
 }
 
 #[bitfield(bits = 16)]
@@ -253,7 +283,7 @@ struct RotParam {
     y: u16,
 }
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 struct WinMask {
     bg: [WinMaskSettings; 4],
     obj: WinMaskSettings,
@@ -261,7 +291,7 @@ struct WinMask {
 }
 
 #[bitfield(bits = 8)]
-#[derive(Default)]
+#[derive(Default, Debug)]
 struct WinMaskSettings {
     area1: WinMaskSetting,
     area2: WinMaskSetting,
@@ -269,14 +299,21 @@ struct WinMaskSettings {
     __: B4,
 }
 
-#[derive(BitfieldSpecifier)]
-#[bits = 2]
-#[derive(Default)]
-enum WinMaskSetting {
-    #[default]
-    Disable = 0,
-    Insize = 1,
-    Outsize = 2,
+impl WinMaskSettings {
+    fn area(&self, i: usize) -> WinMaskSetting {
+        if i == 0 {
+            self.area1()
+        } else {
+            self.area2()
+        }
+    }
+}
+
+#[bitfield(bits = 2)]
+#[derive(BitfieldSpecifier, Default, Debug)]
+struct WinMaskSetting {
+    outside: bool,
+    enable: bool,
 }
 
 #[derive(Default)]
@@ -322,7 +359,7 @@ enum MaskLogic {
 }
 
 #[bitfield(bits = 8)]
-#[derive(Default)]
+#[derive(Default, Debug)]
 struct ScreenDesig {
     bg1: bool,
     bg2: bool,
@@ -346,7 +383,7 @@ impl ScreenDesig {
 }
 
 #[bitfield(bits = 16)]
-#[derive(Default)]
+#[derive(Default, Debug)]
 struct ColorMathCtrl {
     direct_color: bool,
     sub_screen_enable: bool,
@@ -354,19 +391,14 @@ struct ColorMathCtrl {
     __: B2,
     color_math_enable: ColorMathEnable,
     force_main_screen_black: ForceMainScreenBlack,
-    color_math_bg1: bool,
-    color_math_bg2: bool,
-    color_math_bg3: bool,
-    color_math_bg4: bool,
-    color_math_obj_pal47: bool,
-    color_math_backdrop: bool,
+    color_math_enable_kind: B6,
     color_math_half: bool,
-    color_math_add: bool,
+    color_math_subtract: bool,
 }
 
 #[derive(BitfieldSpecifier)]
 #[bits = 2]
-#[derive(Default)]
+#[derive(Default, Debug)]
 enum ColorMathEnable {
     #[default]
     Always = 0,
@@ -377,22 +409,13 @@ enum ColorMathEnable {
 
 #[derive(BitfieldSpecifier)]
 #[bits = 2]
-#[derive(Default)]
+#[derive(Default, Debug)]
 enum ForceMainScreenBlack {
     #[default]
     Never = 0,
     NotMathWindow = 1,
     MathWindow = 2,
     Always = 3,
-}
-
-#[bitfield(bits = 8)]
-#[derive(Default)]
-struct ColorMathData {
-    intensity: B5,
-    r: bool,
-    g: bool,
-    b: bool,
 }
 
 impl Ppu {
@@ -419,8 +442,8 @@ impl Ppu {
     }
 
     pub fn hdma_transfer(&mut self) -> bool {
-        let ret = self.hdma_reload;
-        self.hdma_reload = false;
+        let ret = self.hdma_transfer;
+        self.hdma_transfer = false;
         ret
     }
 }
@@ -670,10 +693,12 @@ impl Ppu {
             }
             0x2126 | 0x2128 => {
                 let ix = (addr - 0x2126) as usize / 2;
+                debug!("Win{ix} L = {data}");
                 self.win_pos[ix].left = data;
             }
             0x2127 | 0x2129 => {
                 let ix = (addr - 0x2127) as usize / 2;
+                debug!("Win{ix} R = {data}");
                 self.win_pos[ix].right = data;
             }
             0x212A => self.win_logic.bytes[0] = data,
@@ -684,7 +709,18 @@ impl Ppu {
             0x212F => self.win_disable_sub.bytes[0] = data,
             0x2130 => self.color_math_ctrl.bytes[0] = data,
             0x2131 => self.color_math_ctrl.bytes[1] = data,
-            0x2132 => self.color_math_data.bytes[0] = data,
+            0x2132 => {
+                let intensity = data & 0x1F;
+                if data & 0x20 != 0 {
+                    self.sub_backdrop.set_r(intensity);
+                }
+                if data & 0x40 != 0 {
+                    self.sub_backdrop.set_g(intensity);
+                }
+                if data & 0x80 != 0 {
+                    self.sub_backdrop.set_b(intensity);
+                }
+            }
             0x2133 => self.display_ctrl.bytes[1] = data,
             _ => todo!("PPU Write: {addr:#06X} = {data:#04X}"),
         }
@@ -717,16 +753,140 @@ struct ObjEntry {
     y_flip: bool,
 }
 
+struct WinCalc {
+    enable: [bool; 2],
+    outside: [bool; 2],
+    logic: MaskLogic,
+    range: [(u32, u32); 2],
+}
+
+impl WinCalc {
+    fn contains(&self, x: u32) -> bool {
+        let in_win1 = if self.enable[0] {
+            Some((self.range[0].0 <= x && x <= self.range[0].1) ^ self.outside[0])
+        } else {
+            None
+        };
+
+        let in_win2 = if self.enable[1] {
+            Some((self.range[1].0 <= x && x <= self.range[1].1) ^ self.outside[1])
+        } else {
+            None
+        };
+
+        match (in_win1, in_win2) {
+            (None, None) => false,
+            (Some(w), None) | (None, Some(w)) => w,
+            (Some(w1), Some(w2)) => match self.logic {
+                MaskLogic::Or => w1 || w2,
+                MaskLogic::And => w1 && w2,
+                MaskLogic::Xor => w1 ^ w2,
+                MaskLogic::Xnor => !(w1 ^ w2),
+            },
+        }
+    }
+}
+
+impl Ppu {
+    fn win_calc_bg(&self, i: usize) -> WinCalc {
+        let enable = [
+            self.win_mask.bg[i].area1().enable(),
+            self.win_mask.bg[i].area2().enable(),
+        ];
+
+        let outside = [
+            self.win_mask.bg[i].area1().outside(),
+            self.win_mask.bg[i].area2().outside(),
+        ];
+
+        let logic = self.win_logic.bg(i);
+
+        let range = [
+            (self.win_pos[0].left as u32, self.win_pos[0].right as u32),
+            (self.win_pos[1].left as u32, self.win_pos[1].right as u32),
+        ];
+
+        WinCalc {
+            enable,
+            outside,
+            logic,
+            range,
+        }
+    }
+
+    fn win_calc_obj(&self) -> WinCalc {
+        let enable = [
+            self.win_mask.obj.area1().enable(),
+            self.win_mask.obj.area2().enable(),
+        ];
+
+        let outside = [
+            self.win_mask.obj.area1().outside(),
+            self.win_mask.obj.area2().outside(),
+        ];
+
+        let logic = self.win_logic.obj();
+
+        let range = [
+            (self.win_pos[0].left as u32, self.win_pos[0].right as u32),
+            (self.win_pos[1].left as u32, self.win_pos[1].right as u32),
+        ];
+
+        WinCalc {
+            enable,
+            outside,
+            logic,
+            range,
+        }
+    }
+
+    fn win_calc_math(&self) -> WinCalc {
+        let enable = [
+            self.win_mask.math.area1().enable(),
+            self.win_mask.math.area2().enable(),
+        ];
+
+        let outside = [
+            self.win_mask.math.area1().outside(),
+            self.win_mask.math.area2().outside(),
+        ];
+
+        let logic = self.win_logic.math();
+
+        let range = [
+            (self.win_pos[0].left as u32, self.win_pos[0].right as u32),
+            (self.win_pos[1].left as u32, self.win_pos[1].right as u32),
+        ];
+
+        WinCalc {
+            enable,
+            outside,
+            logic,
+            range,
+        }
+    }
+}
+
+const PIXEL_KIND_BG1: u8 = 0;
+const PIXEL_KIND_BG2: u8 = 1;
+const PIXEL_KIND_BG3: u8 = 2;
+const PIXEL_KIND_BG4: u8 = 3;
+const PIXEL_KIND_OBJ_HIPAL: u8 = 4;
+const PIXEL_KIND_OBJ_LOPAL: u8 = 6;
+const PIXEL_KIND_BACKDROP: u8 = 5;
+
 impl Ppu {
     fn render_line(&mut self, y: u32) {
         if self.display_ctrl.force_blank() {
-            self.line_buffer.fill(0);
+            self.line_buffer_main.fill(0);
             return;
         }
 
         // Backdrop
-        self.line_buffer.fill(self.cgram[0]);
-        self.z_buffer.fill(0xFF);
+        self.line_buffer_main.fill(self.cgram[0]);
+        self.z_buffer_main.fill(0xF0 | PIXEL_KIND_BACKDROP);
+        self.line_buffer_sub.fill(self.sub_backdrop.into());
+        self.z_buffer_sub.fill(0xF0 | PIXEL_KIND_BACKDROP);
 
         //     Mode0    Mode1    Mode2    Mode3    Mode4    Mode5    Mode6    Mode7
         // 0:  -        BG3.1a   -        -        -        -        -        -
@@ -744,17 +904,19 @@ impl Ppu {
         // 12: BG4.0    BG3.0b   -        -        -        -        -        -
         // FF: Backdrop Backdrop Backdrop Backdrop Backdrop Backdrop Backdrop Backdrop
 
+        log::info!("Screen Desig Main: {:?}", self.screen_desig_main);
+
         match self.bg_mode.mode() {
             0 => {
-                self.render_bg(y, 0, 2, 5, 2);
-                self.render_bg(y, 1, 2, 6, 3);
-                self.render_bg(y, 2, 2, 11, 8);
-                self.render_bg(y, 3, 2, 12, 9);
+                self.render_bg(y, 0, 2, 5, 2, 0x00);
+                self.render_bg(y, 1, 2, 6, 3, 0x20);
+                self.render_bg(y, 2, 2, 11, 8, 0x40);
+                self.render_bg(y, 3, 2, 12, 9, 0x60);
             }
             1 => {
-                self.render_bg(y, 0, 4, 5, 2);
-                self.render_bg(y, 1, 4, 6, 3);
-                self.render_bg(y, 2, 2, 11, 0); // FIXME
+                self.render_bg(y, 0, 4, 5, 2, 0x00);
+                self.render_bg(y, 1, 4, 6, 3, 0x00);
+                self.render_bg(y, 2, 2, 11, 0, 0x00); // FIXME
             }
             2 => todo!("BG Mode 2"),
             3 => todo!("BG Mode 3"),
@@ -766,28 +928,26 @@ impl Ppu {
         }
 
         self.render_obj(y);
-
-        // todo!()
+        self.color_math();
     }
 
     fn copy_line_buffer(&mut self, y: u32) {
         for x in 0..SCREEN_WIDTH {
             *self.frame_buffer.pixel_mut(x as usize, y as usize) =
-                u16_to_pixel(self.line_buffer[x as usize]);
+                u16_to_pixel(self.line_buffer_main[x as usize]);
         }
     }
 
-    fn render_bg(&mut self, y: u32, i: usize, bpp: usize, zl: u8, zh: u8) {
-        if !self.screen_desig_main.bg(i) {
+    fn render_bg(&mut self, y: u32, i: usize, bpp: usize, zl: u8, zh: u8, pal_base: u8) {
+        let enable_main = self.screen_desig_main.bg(i);
+        let enable_sub = self.screen_desig_sub.bg(i);
+
+        if !enable_main && !enable_sub {
             return;
         }
 
         if self.bg_mode.tile_size(i) {
             todo!("16 x 16 Tile mode");
-        }
-
-        if y == 0 {
-            debug!("Render: BG{i}");
         }
 
         // FIXME: base_addr is 6bit (0x3F * 2K = 126K), but VRAM is 64KB. ???
@@ -800,7 +960,8 @@ impl Ppu {
         let vofs = (self.bg_vofs[i] & 0x3FF) as usize;
 
         // TODO: mosaic
-        // TODO: window
+
+        let win_calc = self.win_calc_bg(i);
 
         let pal_size = 1 << bpp;
 
@@ -815,31 +976,40 @@ impl Ppu {
 
         const SC_SIZE: usize = 32 * 32 * 2;
 
+        let pixel_kind = match i {
+            0 => PIXEL_KIND_BG1,
+            1 => PIXEL_KIND_BG2,
+            2 => PIXEL_KIND_BG3,
+            3 => PIXEL_KIND_BG4,
+            _ => unreachable!(),
+        };
+
         // FIXME: optimize
         for x in 0..SCREEN_WIDTH {
+            let in_win = win_calc.contains(x);
+            let render_main = enable_main && !in_win;
+            let render_sub = enable_sub && !in_win;
+
+            if !render_main && !render_sub {
+                continue;
+            }
+
             let sx = x as usize + hofs;
             let sc_x = sx / 8 / 32 % sc_w;
             let sc_y = sy / 8 / 32 % sc_h;
             let tile_x = sx / 8 % 32;
             let tile_y = sy / 8 % 32;
-            let pixel_x = sx % 8;
-            let pixel_y = sy % 8;
 
             let sc_addr = sc_base_addr + (sc_x + sc_y * sc_w) * SC_SIZE;
             let entry_addr = (sc_addr + (tile_x + tile_y * 32) * 2) & 0xFFFE;
 
-            // debug!(
-            //     "SC Base: {}, base addr: {sc_base_addr:04X}, sc: ({sc_x}/{sc_w}, {sc_y}/{sc_h}), tile: ({tile_x}, {tile_y}), entry: {entry_addr:04X}",
-            //     self.bg_sc[i].base_addr()
-            // );
-
             let entry =
                 BgMapEntry::from_bytes(self.vram[entry_addr..entry_addr + 2].try_into().unwrap());
 
-            let z = if entry.priority() == 0 { zl } else { zh };
+            let z = if entry.priority() == 0 { zl } else { zh } * 0x10 + pixel_kind;
 
-            let pixel_x = if entry.x_flip() { pixel_x } else { 7 - pixel_x };
-            let pixel_y = if entry.y_flip() { 7 - pixel_y } else { pixel_y };
+            let pixel_x = if !entry.x_flip() { sx % 8 } else { 7 - sx % 8 };
+            let pixel_y = if !entry.y_flip() { sy % 8 } else { 7 - sy % 8 };
 
             let tile_addr = tile_base_addr + entry.char_num() as usize * bpp as usize * 8;
 
@@ -848,13 +1018,20 @@ impl Ppu {
                 let addr = tile_addr + i * 16 + pixel_y * 2;
                 let b0 = self.vram[addr];
                 let b1 = self.vram[addr + 1];
-                pixel |= ((b0 >> pixel_x) & 1) | (((b1 >> pixel_x) & 1) << 1) << (i * 2);
+                pixel |= ((b0 >> (7 - pixel_x)) & 1) << (i * 2);
+                pixel |= ((b1 >> (7 - pixel_x)) & 1) << (i * 2 + 1);
             }
 
-            if pixel != 0 && z < self.z_buffer[x as usize] {
-                let col = self.cgram[entry.pal_num() as usize * pal_size + pixel as usize];
-                self.line_buffer[x as usize] = col;
-                self.z_buffer[x as usize] = z;
+            if pixel != 0 {
+                let col = self.cgram[(pal_base + entry.pal_num() * pal_size + pixel) as usize];
+                if render_main && z < self.z_buffer_main[x as usize] {
+                    self.line_buffer_main[x as usize] = col;
+                    self.z_buffer_main[x as usize] = z;
+                }
+                if render_sub && z < self.z_buffer_sub[x as usize] {
+                    self.line_buffer_sub[x as usize] = col;
+                    self.z_buffer_sub[x as usize] = z;
+                }
             }
         }
     }
@@ -868,7 +1045,7 @@ impl Ppu {
 
         const OBJ_Z_TABLE: [u8; 4] = [10, 7, 4, 1];
         const BPP: usize = 4;
-        const PAL_SIZE: usize = 16;
+        const PAL_SIZE: u8 = 16;
 
         let tile_base_addr = self.obj_sel.tile_base_addr() as usize;
         let addr_gap = self.obj_sel.addr_gap() as usize;
@@ -891,12 +1068,12 @@ impl Ppu {
             let dy = y - oy;
             let pixel_y = if !entry.y_flip() { dy } else { oh - 1 - dy };
 
-            let z = OBJ_Z_TABLE[entry.priority() as usize];
-
-            log::info!(
-                "Render OBJ {i}: ({ox}, {oy}), tile num: {}",
-                entry.tile_num()
-            );
+            let z = OBJ_Z_TABLE[entry.priority() as usize] * 0x10
+                + if entry.pal_num() < 4 {
+                    PIXEL_KIND_OBJ_LOPAL
+                } else {
+                    PIXEL_KIND_OBJ_HIPAL
+                };
 
             let tile_num = entry.tile_num() as usize;
             let tile_num = tile_num & 0x10F | ((tile_num & 0xF0) + pixel_y / 8 * 16) & 0xF0;
@@ -909,11 +1086,8 @@ impl Ppu {
                 let pixel_x = if !entry.x_flip() { dx } else { ow - 1 - dx } as usize;
 
                 let tile_num = tile_num & 0x1F0 | ((tile_num & 0xF) + pixel_x / 8) & 0xF;
-                let tile_addr = if tile_num & 0x100 == 0 {
-                    tile_base_addr + tile_num as usize * BPP * 8
-                } else {
-                    tile_base_addr + addr_gap + (tile_num as usize & 0xFF) * BPP * 8
-                };
+                let tile_addr =
+                    tile_base_addr + (tile_num >> 8) * addr_gap + tile_num as usize * BPP * 8;
 
                 let mut pixel = 0;
                 for i in 0..BPP / 2 {
@@ -924,13 +1098,78 @@ impl Ppu {
                     pixel |= ((b1 >> (7 - pixel_x % 8)) & 1) << (i * 2 + 1);
                 }
 
-                if pixel != 0 && z < self.z_buffer[x as usize] {
-                    let col =
-                        self.cgram[0x80 + entry.pal_num() as usize * PAL_SIZE + pixel as usize];
-                    self.line_buffer[x as usize] = col;
-                    self.z_buffer[x as usize] = z;
+                if pixel != 0 && z < self.z_buffer_main[x as usize] {
+                    let col = self.cgram[(0x80 + entry.pal_num() * PAL_SIZE + pixel) as usize];
+                    self.line_buffer_main[x as usize] = col;
+                    self.z_buffer_main[x as usize] = z;
                 }
             }
+        }
+    }
+
+    fn color_math(&mut self) {
+        if self.color_math_ctrl.direct_color() {
+            todo!("Color math direct color mode");
+        }
+
+        let win_calc = self.win_calc_math();
+
+        log::info!("Color path parms: {:X?}", self.color_math_ctrl);
+
+        for x in 0..SCREEN_WIDTH {
+            let in_win = win_calc.contains(x);
+
+            let force_main_black = match self.color_math_ctrl.force_main_screen_black() {
+                ForceMainScreenBlack::Never => false,
+                ForceMainScreenBlack::NotMathWindow => !in_win,
+                ForceMainScreenBlack::MathWindow => in_win,
+                ForceMainScreenBlack::Always => true,
+            };
+
+            let main = Rgb555::from(if force_main_black {
+                0
+            } else {
+                self.line_buffer_main[x as usize]
+            });
+
+            let sub = Rgb555::from(if self.color_math_ctrl.sub_screen_enable() {
+                self.line_buffer_sub[x as usize]
+            } else {
+                self.sub_backdrop.into()
+            });
+
+            let enable = match self.color_math_ctrl.color_math_enable() {
+                ColorMathEnable::Always => true,
+                ColorMathEnable::MathWindow => in_win,
+                ColorMathEnable::NotMathWindow => !in_win,
+                ColorMathEnable::Never => false,
+            };
+
+            let enable = if !enable {
+                false
+            } else {
+                let pixel_kind = self.z_buffer_main[x as usize] & 0xF;
+                self.color_math_ctrl.color_math_enable_kind() & (1 << pixel_kind) != 0
+            };
+
+            self.line_buffer_main[x as usize] = if enable {
+                if self.color_math_ctrl.color_math_subtract() {
+                    if self.color_math_ctrl.color_math_half() {
+                        main.blend::<false, true>(sub)
+                    } else {
+                        main.blend::<false, false>(sub)
+                    }
+                } else {
+                    if self.color_math_ctrl.color_math_half() {
+                        main.blend::<true, true>(sub)
+                    } else {
+                        main.blend::<true, false>(sub)
+                    }
+                }
+            } else {
+                main
+            }
+            .into();
         }
     }
 }
