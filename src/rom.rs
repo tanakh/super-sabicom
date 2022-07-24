@@ -320,7 +320,9 @@ fn try_from_bytes(bytes: &[u8], header_pos: usize) -> Result<Rom, RomError> {
     let header = &bytes[header_pos..header_pos + 0x100];
 
     let title = header[0xC0..=0xD4].to_vec();
-    if !title.iter().all(|&b| b.is_ascii_uppercase() || b == b' ') {
+    if !title.iter().all(|&b| {
+        b.is_ascii_uppercase() || b.is_ascii_digit() || b.is_ascii_punctuation() || b == b' '
+    }) {
         Err(RomError::InvalidTitleString)?
     }
 
