@@ -931,8 +931,6 @@ impl Ppu {
         // 12: BG4.0    BG3.0b   -        -        -        -        -        -
         // FF: Backdrop Backdrop Backdrop Backdrop Backdrop Backdrop Backdrop Backdrop
 
-        log::info!("Screen Desig Main: {:?}", self.screen_desig_main);
-
         match self.bg_mode.mode() {
             0 => {
                 self.render_bg(y, 0, 2, 5, 2, 0x00);
@@ -975,10 +973,10 @@ impl Ppu {
     fn render_bg(&mut self, y: u32, i: usize, bpp: usize, zl: u8, zh: u8, pal_base: u8) {
         let enable_main = self.screen_desig_main.bg(i);
         let enable_sub = self.screen_desig_sub.bg(i);
-
         if !enable_main && !enable_sub {
             return;
         }
+        let win_calc = self.win_calc_bg(i);
 
         if self.bg_mode.tile_size(i) {
             todo!("16 x 16 Tile mode");
@@ -986,8 +984,6 @@ impl Ppu {
 
         // FIXME: base_addr is 6bit (0x3F * 2K = 126K), but VRAM is 64KB. ???
         let sc_base_addr = self.bg_sc[i].base_addr() as usize * 2 * 1024;
-        let sc_size = self.bg_sc[i].size();
-
         let tile_base_addr = self.bg_tile_base_addr[i] as usize * 8 * 1024;
 
         let hofs = (self.bg_hofs[i] & 0x3FF) as usize;
@@ -995,14 +991,12 @@ impl Ppu {
 
         // TODO: mosaic
 
-        let win_calc = self.win_calc_bg(i);
-
         let pal_size = 1 << bpp;
 
-        let (sc_w, sc_h) = match sc_size {
+        let (sc_w, sc_h) = match self.bg_sc[i].size() {
             ScreenSize::OneScreen => (1, 1),
-            ScreenSize::VMirror => (1, 2),
-            ScreenSize::HMirror => (2, 1),
+            ScreenSize::VMirror => (2, 1),
+            ScreenSize::HMirror => (1, 2),
             ScreenSize::FourScren => (2, 2),
         };
 
@@ -1070,8 +1064,102 @@ impl Ppu {
     }
 
     fn render_bg_mode7(&mut self, y: u32, z: u8) {
-        // FIXME: Mode 7 breaks MPY
-        todo!()
+        let enable_main = self.screen_desig_main.bg(0);
+        let enable_sub = self.screen_desig_sub.bg(0);
+        if !enable_main && !enable_sub {
+            return;
+        }
+        let win_calc = self.win_calc_bg(0);
+
+        let z = z * 0x10 + PIXEL_KIND_BG1;
+
+        let x_flip = if self.rot_setting.h_flip() { 0xFF } else { 0 };
+        let y_flip = if self.rot_setting.v_flip() { 0xFF } else { 0 };
+        let screen_over = self.rot_setting.screen_over();
+
+        fn sext16(n: u16) -> i32 {
+            ((n as i32) << 16) >> 16
+        }
+        fn sext13(n: u16) -> i32 {
+            ((n as i32) << 19) >> 19
+        }
+
+        let sy = (y ^ y_flip) as i32;
+        let sx = x_flip as i32;
+
+        let m7a = sext16(self.rot_param.a);
+        let m7b = sext16(self.rot_param.b);
+        let m7c = sext16(self.rot_param.c);
+        let m7d = sext16(self.rot_param.d);
+        let m7x = sext13(self.rot_param.x);
+        let m7y = sext13(self.rot_param.y);
+        let m7vofs = sext13(self.m7_vofs);
+        let m7hofs = sext13(self.m7_hofs);
+
+        let mut orgx = (m7hofs - m7x) & !0x1C00;
+        if orgx < 0 {
+            orgx |= 0x1C00;
+        }
+        let mut orgy = (m7vofs - m7y) & !0x1C00;
+        if orgy < 0 {
+            orgy |= 0x1C00;
+        }
+
+        let lx = ((m7a * orgx) & !0x3F) + ((m7b * orgy) & !0x3F) + m7x * 0x100;
+        let ly = ((m7c * orgx) & !0x3F) + ((m7d * orgy) & !0x3F) + m7y * 0x100;
+        let lx = lx + ((m7b * sy) & !0x3F) + (m7a * sx) as i32;
+        let ly = ly + ((m7d * sy) & !0x3F) + (m7c * sx) as i32;
+
+        let dx = if x_flip != 0 { -m7a } else { m7a };
+        let dy = if y_flip != 0 { -m7c } else { m7c };
+
+        for x in 0..SCREEN_WIDTH {
+            let vx = lx + dx * (x as i32);
+            let vy = ly + dy * (x as i32);
+
+            let in_win = win_calc.contains(x);
+            let render_main = enable_main && !in_win;
+            let render_sub = enable_sub && !in_win;
+            if !render_main && !render_sub {
+                continue;
+            }
+
+            let ofs_x = ((vx >> 8) & 7) as usize;
+            let ofs_y = ((vy >> 8) & 7) as usize;
+            let tile_x = ((vx >> 11) & 0x7F) as usize;
+            let tile_y = ((vy >> 11) & 0x7F) as usize;
+
+            let (tile_x, tile_y) = if vx >> 18 != 0 || vy >> 18 != 0 {
+                match screen_over {
+                    // Wrap
+                    0 | 1 => (tile_x, tile_y),
+                    // Transparent
+                    2 => continue,
+                    // Filled by tile 0x00
+                    3 => (0, 0),
+                    _ => unreachable!(),
+                }
+            } else {
+                (tile_x, tile_y)
+            };
+
+            let tile_addr = (tile_x + tile_y * 128) * 2;
+            let char_num = self.vram[tile_addr] as usize;
+            let char_addr = char_num * 128 + ofs_y * 16 + ofs_x * 2 + 1;
+            let pixel = self.vram[char_addr];
+
+            if pixel != 0 {
+                let col = self.cgram[pixel as usize];
+                if render_main && z < self.z_buffer_main[x as usize] {
+                    self.line_buffer_main[x as usize] = col;
+                    self.z_buffer_main[x as usize] = z;
+                }
+                if render_sub && z < self.z_buffer_sub[x as usize] {
+                    self.line_buffer_sub[x as usize] = col;
+                    self.z_buffer_sub[x as usize] = z;
+                }
+            }
+        }
     }
 
     fn render_obj(&mut self, y: u32) {
@@ -1248,9 +1336,9 @@ fn u16_to_pixel(p: u16) -> Pixel {
     let r = (p & 0x1F) as u8;
     let g = ((p >> 5) & 0x1F) as u8;
     let b = ((p >> 10) & 0x1F) as u8;
-
-    fn extend(c: u8) -> u8 {
-        c << 3 | c >> 2
-    }
     Pixel::new(extend(r), extend(g), extend(b))
+}
+
+fn extend(c: u8) -> u8 {
+    c << 3 | c >> 2
 }
