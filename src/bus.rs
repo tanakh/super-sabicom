@@ -204,7 +204,7 @@ impl Bus {
         let offset = addr as u16;
 
         let data = match bank {
-            0x00..=0x7D | 0x80..=0xBF => match offset {
+            0x00..=0x3F | 0x80..=0xBF => match offset {
                 0x0000..=0x1FFF => {
                     ctx.elapse(CYCLES_SLOW);
                     self.wram[offset as usize]
@@ -239,11 +239,15 @@ impl Bus {
                     ctx.rom().read(addr)
                 }
             },
+            0x40..=0x7D => {
+                ctx.elapse(CYCLES_SLOW);
+                ctx.rom().read(addr)
+            }
             0x7E..=0x7F => {
                 ctx.elapse(CYCLES_SLOW);
                 self.wram[(addr & 0x1FFFF) as usize]
             }
-            0x80..=0xFF => {
+            0xC0..=0xFF => {
                 ctx.elapse(self.ws2_access_cycle);
                 ctx.rom().read(addr)
             }
@@ -258,13 +262,14 @@ impl Bus {
         let offset = addr as u16;
 
         Some(match bank {
-            0x00..=0x7D | 0x80..=0xBF => match offset {
+            0x00..=0x3F | 0x80..=0xBF => match offset {
                 0x0000..=0x1FFF => self.wram[offset as usize],
                 0x8000..=0xFFFF => ctx.rom().read(addr),
                 _ => None?,
             },
+            0x40..=0x7D => ctx.rom().read(addr),
             0x7E..=0x7F => self.wram[(addr & 0x1FFFF) as usize],
-            0x80..=0xFF => ctx.rom().read(addr),
+            0xC0..=0xFF => ctx.rom().read(addr),
             _ => unreachable!(),
         })
     }
@@ -276,7 +281,7 @@ impl Bus {
         trace!("Write:  {bank:02X}:{offset:04X} = {data:#04X}");
 
         match bank {
-            0x00..=0x7D | 0x80..=0xBF => match offset {
+            0x00..=0x3F | 0x80..=0xBF => match offset {
                 0x0000..=0x1FFF => {
                     ctx.elapse(CYCLES_SLOW);
                     self.wram[offset as usize] = data;
@@ -311,11 +316,15 @@ impl Bus {
                     ctx.rom_mut().write(addr, data);
                 }
             },
+            0x40..=0x7D => {
+                ctx.elapse(CYCLES_SLOW);
+                ctx.rom_mut().write(addr, data)
+            }
             0x7E..=0x7F => {
                 ctx.elapse(CYCLES_SLOW);
                 self.wram[(addr & 0x1FFFF) as usize] = data
             }
-            0x80..=0xFF => {
+            0xC0..=0xFF => {
                 ctx.elapse(self.ws2_access_cycle);
                 ctx.rom_mut().write(addr, data);
             }
