@@ -22,6 +22,8 @@ pub struct Ppu {
     bg_tile_base_addr: [u8; 4],
     bg_hofs: [u16; 4],
     bg_vofs: [u16; 4],
+    m7_hofs: u16,
+    m7_vofs: u16,
     rot_setting: RotSetting,
     rot_param: RotParam,
     mul_result: i32,
@@ -64,6 +66,8 @@ pub struct Ppu {
     v_latch: u32,
     v_flipflop: bool,
     hv_latched: bool,
+    bg_old: u8,
+    m7_old: u8,
 
     #[educe(Default(
         expression = "FrameBuffer::new(SCREEN_WIDTH.try_into().unwrap(), SCREEN_HEIGHT.try_into().unwrap())"
@@ -87,6 +91,7 @@ struct Rgb555 {
     r: B5,
     g: B5,
     b: B5,
+    #[skip]
     unused: B1,
 }
 
@@ -105,6 +110,14 @@ impl Rgb555 {
             let b = (self.b().saturating_sub(rhs.b())) / if HALF { 2 } else { 1 };
             Self::new().with_r(r).with_g(g).with_b(b)
         }
+    }
+
+    #[inline]
+    fn fade(&self, level: u8) -> Self {
+        let r = ((self.r() as u16 * level as u16) / 16) as u8;
+        let g = ((self.g() as u16 * level as u16) / 16) as u8;
+        let b = ((self.b() as u16 * level as u16) / 16) as u8;
+        Self::new().with_r(r).with_g(g).with_b(b)
     }
 }
 
@@ -297,16 +310,6 @@ struct WinMaskSettings {
     area2: WinMaskSetting,
     #[skip]
     __: B4,
-}
-
-impl WinMaskSettings {
-    fn area(&self, i: usize) -> WinMaskSetting {
-        if i == 0 {
-            self.area1()
-        } else {
-            self.area2()
-        }
-    }
 }
 
 #[bitfield(bits = 2)]
@@ -634,13 +637,27 @@ impl Ppu {
                 self.bg_tile_base_addr[ix] = data & 0xF;
                 self.bg_tile_base_addr[ix + 1] = data >> 4;
             }
+
             0x210D | 0x210F | 0x2111 | 0x2113 => {
                 let ix = (addr - 0x210D) as usize / 2;
-                self.bg_hofs[ix] = self.bg_hofs[ix] >> 8 | (data as u16) << 8;
+                self.bg_hofs[ix] =
+                    (data as u16) << 8 | (self.bg_old & !7) as u16 | ((self.bg_hofs[ix] >> 8) & 7);
+                self.bg_old = data;
+
+                if ix == 0 {
+                    self.m7_hofs = (data as u16) << 8 | self.m7_old as u16;
+                    self.m7_old = data;
+                }
             }
             0x210E | 0x2110 | 0x2112 | 0x2114 => {
                 let ix = (addr - 0x210E) as usize / 2;
-                self.bg_vofs[ix] = self.bg_vofs[ix] >> 8 | (data as u16) << 8;
+                self.bg_vofs[ix] = (data as u16) << 8 | self.bg_old as u16;
+                self.bg_old = data;
+
+                if ix == 0 {
+                    self.m7_vofs = (data as u16) << 8 | self.m7_old as u16;
+                    self.m7_old = data;
+                }
             }
             0x2115 => self.vram_addr_inc_mode.bytes[0] = data,
             0x2116 => self.vram_addr = self.vram_addr & 0x7F00 | data as u16,
@@ -655,18 +672,34 @@ impl Ppu {
                 }
             }
             0x211A => self.rot_setting.bytes[0] = data,
+
             0x211B => {
-                self.rot_param.a = self.rot_param.a >> 8 | (data as u16) << 8;
+                self.rot_param.a = (data as u16) << 8 | self.m7_old as u16;
+                self.m7_old = data;
                 self.mul_result = self.rot_param.a as i16 as i32 * self.rot_param.b as i8 as i32;
             }
             0x211C => {
-                self.rot_param.b = self.rot_param.b >> 8 | (data as u16) << 8;
+                self.rot_param.b = (data as u16) << 8 | self.m7_old as u16;
+                self.m7_old = data;
                 self.mul_result = self.rot_param.a as i16 as i32 * self.rot_param.b as i8 as i32;
             }
-            0x211D => self.rot_param.c = self.rot_param.c >> 8 | (data as u16) << 8,
-            0x211E => self.rot_param.d = self.rot_param.d >> 8 | (data as u16) << 8,
-            0x211F => self.rot_param.x = self.rot_param.x >> 8 | (data as u16) << 8,
-            0x2120 => self.rot_param.y = self.rot_param.y >> 8 | (data as u16) << 8,
+            0x211D => {
+                self.rot_param.c = (data as u16) << 8 | self.m7_old as u16;
+                self.m7_old = data;
+            }
+            0x211E => {
+                self.rot_param.d = (data as u16) << 8 | self.m7_old as u16;
+                self.m7_old = data;
+            }
+            0x211F => {
+                self.rot_param.x = (data as u16) << 8 | self.m7_old as u16;
+                self.m7_old = data;
+            }
+            0x2120 => {
+                self.rot_param.y = (data as u16) << 8 | self.m7_old as u16;
+                self.m7_old = data;
+            }
+
             0x2121 => self.cgram_addr = data as u16 * 2,
             0x2122 => {
                 debug!("CGRAM: {:03X} = {data:02X}", self.cgram_addr);
@@ -725,12 +758,6 @@ impl Ppu {
             _ => todo!("PPU Write: {addr:#06X} = {data:#04X}"),
         }
     }
-}
-
-enum ColorMode {
-    Color4,
-    Color16,
-    Color256,
 }
 
 #[bitfield(bits = 16)]
@@ -916,14 +943,21 @@ impl Ppu {
             1 => {
                 self.render_bg(y, 0, 4, 5, 2, 0x00);
                 self.render_bg(y, 1, 4, 6, 3, 0x00);
-                self.render_bg(y, 2, 2, 11, 0, 0x00); // FIXME
+                if !self.bg_mode.bg3_priority_is_high() {
+                    self.render_bg(y, 2, 2, 12, 8, 0x00);
+                } else {
+                    self.render_bg(y, 2, 2, 11, 0, 0x00);
+                }
             }
             2 => todo!("BG Mode 2"),
             3 => todo!("BG Mode 3"),
             4 => todo!("BG Mode 4"),
             5 => todo!("BG Mode 5"),
             6 => todo!("BG Mode 6"),
-            7 => log::warn!("BG Mode 7"),
+            7 => {
+                self.render_bg_mode7(y, 8);
+                // TODO: EXTBG
+            }
             _ => unreachable!(),
         }
 
@@ -989,7 +1023,6 @@ impl Ppu {
             let in_win = win_calc.contains(x);
             let render_main = enable_main && !in_win;
             let render_sub = enable_sub && !in_win;
-
             if !render_main && !render_sub {
                 continue;
             }
@@ -1036,16 +1069,25 @@ impl Ppu {
         }
     }
 
+    fn render_bg_mode7(&mut self, y: u32, z: u8) {
+        // FIXME: Mode 7 breaks MPY
+        todo!()
+    }
+
     fn render_obj(&mut self, y: u32) {
-        if !self.screen_desig_main.obj() {
+        let enable_main = self.screen_desig_main.obj();
+        let enable_sub = self.screen_desig_sub.obj();
+
+        if !enable_main && !enable_sub {
             return;
         }
 
         let y = y as usize;
 
-        const OBJ_Z_TABLE: [u8; 4] = [10, 7, 4, 1];
         const BPP: usize = 4;
         const PAL_SIZE: u8 = 16;
+
+        const OBJ_Z: [u8; 4] = [10, 7, 4, 1];
 
         let tile_base_addr = self.obj_sel.tile_base_addr() as usize;
         let addr_gap = self.obj_sel.addr_gap() as usize;
@@ -1055,7 +1097,15 @@ impl Ppu {
             self.obj_sel.obj_size_sel().size_large(),
         ];
 
+        let win_calc = self.win_calc_obj();
+
         for i in 0..128 {
+            let i = if !self.oam_addr.priority_rotation() {
+                i
+            } else {
+                127 - i
+            };
+
             let entry = ObjEntry::from_bytes(self.oam[i * 4..i * 4 + 4].try_into().unwrap());
             let extra = (self.oam[0x200 + i / 4] >> ((i & 3) * 2)) & 3;
 
@@ -1068,7 +1118,7 @@ impl Ppu {
             let dy = y - oy;
             let pixel_y = if !entry.y_flip() { dy } else { oh - 1 - dy };
 
-            let z = OBJ_Z_TABLE[entry.priority() as usize] * 0x10
+            let z = OBJ_Z[entry.priority() as usize] * 0x10
                 + if entry.pal_num() < 4 {
                     PIXEL_KIND_OBJ_LOPAL
                 } else {
@@ -1083,6 +1133,14 @@ impl Ppu {
                 if !(0..SCREEN_WIDTH as usize).contains(&x) {
                     continue;
                 }
+
+                let in_win = win_calc.contains(x as u32);
+                let render_main = enable_main && !in_win;
+                let render_sub = enable_sub && !in_win;
+                if !render_main && !render_sub {
+                    continue;
+                }
+
                 let pixel_x = if !entry.x_flip() { dx } else { ow - 1 - dx } as usize;
 
                 let tile_num = tile_num & 0x1F0 | ((tile_num & 0xF) + pixel_x / 8) & 0xF;
@@ -1098,10 +1156,16 @@ impl Ppu {
                     pixel |= ((b1 >> (7 - pixel_x % 8)) & 1) << (i * 2 + 1);
                 }
 
-                if pixel != 0 && z < self.z_buffer_main[x as usize] {
+                if pixel != 0 {
                     let col = self.cgram[(0x80 + entry.pal_num() * PAL_SIZE + pixel) as usize];
-                    self.line_buffer_main[x as usize] = col;
-                    self.z_buffer_main[x as usize] = z;
+                    if render_main && z & 0xF0 < self.z_buffer_main[x as usize] & 0xF0 {
+                        self.line_buffer_main[x as usize] = col;
+                        self.z_buffer_main[x as usize] = z;
+                    }
+                    if render_sub && z & 0xF0 < self.z_buffer_sub[x as usize] & 0xF0 {
+                        self.line_buffer_sub[x as usize] = col;
+                        self.z_buffer_sub[x as usize] = z;
+                    }
                 }
             }
         }
@@ -1113,8 +1177,7 @@ impl Ppu {
         }
 
         let win_calc = self.win_calc_math();
-
-        log::info!("Color path parms: {:X?}", self.color_math_ctrl);
+        let master_brightness = self.display_ctrl.master_brightness();
 
         for x in 0..SCREEN_WIDTH {
             let in_win = win_calc.contains(x);
@@ -1152,7 +1215,7 @@ impl Ppu {
                 self.color_math_ctrl.color_math_enable_kind() & (1 << pixel_kind) != 0
             };
 
-            self.line_buffer_main[x as usize] = if enable {
+            let result = if enable {
                 if self.color_math_ctrl.color_math_subtract() {
                     if self.color_math_ctrl.color_math_half() {
                         main.blend::<false, true>(sub)
@@ -1168,8 +1231,15 @@ impl Ppu {
                 }
             } else {
                 main
-            }
-            .into();
+            };
+
+            let result = if master_brightness == 0 {
+                Rgb555::from(0)
+            } else {
+                result.fade(master_brightness + 1)
+            };
+
+            self.line_buffer_main[x as usize] = result.into();
         }
     }
 }
