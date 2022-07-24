@@ -288,32 +288,6 @@ opcodes! {
     sed       ; sbc a, aby; pop x     ; xce       ; jsr aix   ; sbc a, abx; inc abx  ; sbc a, fax; // F8
 }
 
-fn read8(ctx: &mut impl Context, addr: u32) -> u8 {
-    ctx.read(addr)
-}
-
-fn read16(ctx: &mut impl Context, addr: u32) -> u16 {
-    let b0 = ctx.read(addr);
-    let b1 = ctx.read((addr + 1) & 0x00FFFFFF);
-    (b0 as u16) | ((b1 as u16) << 8)
-}
-
-fn read24(ctx: &mut impl Context, addr: u32) -> u32 {
-    let b0 = ctx.read(addr);
-    let b1 = ctx.read((addr + 1) & 0x00FFFFFF);
-    let b2 = ctx.read((addr + 2) & 0x00FFFFFF);
-    (b0 as u32) | ((b1 as u32) << 8) | ((b2 as u32) << 16)
-}
-
-fn write8(ctx: &mut impl Context, addr: u32, data: u8) {
-    ctx.write(addr, data);
-}
-
-fn write16(ctx: &mut impl Context, addr: u32, data: u16) {
-    ctx.write(addr, data as u8);
-    ctx.write((addr + 1) & 0x00FFFFFF, (data >> 8) as u8);
-}
-
 #[rustfmt::skip]
 macro_rules! is_8bit {
     ($cpu:expr, mem) => { $cpu.regs.e || $cpu.regs.p.m() };
@@ -326,10 +300,76 @@ macro_rules! is_8bit {
     ($cpu:expr, db) => { true };
 }
 
+trait Addr<Offset: From<u8>>: Sized {
+    fn unwrap(&self) -> u32;
+    fn offset(&self, offset: Offset) -> Self;
+
+    fn read8(&self, ctx: &mut impl Context) -> u8 {
+        ctx.read(self.unwrap())
+    }
+    fn read16(&self, ctx: &mut impl Context) -> u16 {
+        let b0 = self.read8(ctx);
+        let b1 = self.offset(1.into()).read8(ctx);
+        (b0 as u16) | (b1 as u16) << 8
+    }
+    fn read24(&self, ctx: &mut impl Context) -> u32 {
+        let b0 = self.read8(ctx);
+        let b1 = self.offset(1.into()).read8(ctx);
+        let b2 = self.offset(2.into()).read8(ctx);
+        (b0 as u32) | (b1 as u32) << 8 | (b2 as u32) << 16
+    }
+
+    fn write8(&self, ctx: &mut impl Context, data: u8) {
+        ctx.write(self.unwrap(), data);
+    }
+    fn write16(&self, ctx: &mut impl Context, data: u16) {
+        self.write8(ctx, data as u8);
+        self.offset(1.into()).write8(ctx, (data >> 8) as u8);
+    }
+    // fn write24(&self, ctx: &mut impl Context, data: u32) {
+    //     self.write8(ctx, data as u8);
+    //     self.offset(1.into()).write8(ctx, (data >> 8) as u8);
+    //     self.offset(2.into()).write8(ctx, (data >> 16) as u8);
+    // }
+}
+
+struct Wrap8Addr(u32);
+
+impl Addr<u8> for Wrap8Addr {
+    fn unwrap(&self) -> u32 {
+        self.0
+    }
+    fn offset(&self, offset: u8) -> Self {
+        Self(self.0 & 0xFFFF00 | (self.0 as u8).wrapping_add(offset) as u32)
+    }
+}
+
+struct Wrap16Addr(u32);
+
+impl Addr<u16> for Wrap16Addr {
+    fn unwrap(&self) -> u32 {
+        self.0
+    }
+    fn offset(&self, offset: u16) -> Self {
+        Self(self.0 & 0xFF0000 | (self.0 as u16).wrapping_add(offset) as u32)
+    }
+}
+
+struct Wrap24Addr(u32);
+
+impl Addr<u32> for Wrap24Addr {
+    fn unwrap(&self) -> u32 {
+        self.0
+    }
+    fn offset(&self, offset: u32) -> Self {
+        Self((self.0 + offset) & 0xFFFFFF)
+    }
+}
+
 impl Cpu {
     pub fn reset(&mut self, ctx: &mut impl Context) {
         self.regs = Registers::default();
-        self.regs.pc = read16(ctx, RESET_VECTOR as u32);
+        self.regs.pc = Wrap16Addr(RESET_VECTOR as u32).read16(ctx);
     }
 
     fn fetch8(&mut self, ctx: &mut impl Context) -> u8 {
@@ -363,7 +403,11 @@ impl Cpu {
     }
 
     fn pop8(&mut self, ctx: &mut impl Context) -> u8 {
-        self.regs.s = self.regs.s.wrapping_add(1);
+        if !self.regs.e {
+            self.regs.s = self.regs.s.wrapping_add(1);
+        } else {
+            self.regs.s = self.regs.s & 0xFF00 | (self.regs.s as u8).wrapping_add(1) as u16;
+        }
         ctx.read(self.regs.s as u32)
     }
     fn pop16(&mut self, ctx: &mut impl Context) -> u16 {
@@ -392,7 +436,7 @@ impl Cpu {
         self.regs.p.set_d(false);
         self.regs.p.set_i(true);
         self.regs.pb = 0;
-        self.regs.pc = read16(ctx, e.vector_addr(self.regs.e) as u32);
+        self.regs.pc = Wrap16Addr(e.vector_addr(self.regs.e) as u32).read16(ctx);
     }
 
     fn check_invaliant(&self) -> bool {
@@ -479,13 +523,11 @@ impl Cpu {
             // ld
             (ld $reg:ident, $addrmode:ident) => {
                 if is_8bit!(self, $reg) {
-                    let addr = addr!($addrmode, u8);
-                    let v = read8(ctx, addr);
+                    let v = rd!($addrmode, u8);
                     self.regs.set_nz(v);
                     set_reg!($reg, v)
                 } else {
-                    let addr = addr!($addrmode, u16);
-                    let v = read16(ctx, addr);
+                    let v = rd!($addrmode, u16);
                     self.regs.set_nz(v);
                     set_reg!($reg, v)
                 }
@@ -493,20 +535,17 @@ impl Cpu {
 
             // st
             (st $addrmode:ident, zr) => {{
-                let addr = addr!($addrmode);
                 if is_8bit!(self, mem) {
-                    write8(ctx, addr, 0);
+                    wr!($addrmode, 0, u8)
                 } else {
-                    write16(ctx, addr, 0);
+                    wr!($addrmode, 0, u16)
                 }
             }};
             (st $addrmode:ident, $reg:ident) => {
                 if is_8bit!(self, $reg) {
-                    let addr = addr!($addrmode);
-                    write8(ctx, addr, reg!($reg) as u8);
+                    wr!($addrmode, reg!($reg) as u8, u8)
                 } else {
-                    let addr = addr!($addrmode);
-                    write16(ctx, addr, reg!($reg));
+                    wr!($addrmode, reg!($reg), u16)
                 }
             };
 
@@ -521,11 +560,11 @@ impl Cpu {
                 self.push8(ctx, self.regs.db)
             };
             (push ind) => {{
-                let addr = addr!(ind) as u16;
+                let addr = addr!(ind).unwrap() as u16;
                 self.push16(ctx, addr)
             }};
             (push abs) => {{
-                let addr = addr!(abs) as u16;
+                let addr = addr!(abs).unwrap() as u16;
                 self.push16(ctx, addr)
             }};
             (push rel) => {{
@@ -599,15 +638,13 @@ impl Cpu {
                     }};
                 }
                 if is_8bit!(self, a) {
-                    let addr = addr!($opr, u8);
+                    let b = rd!($opr, u8);
                     let a = self.regs.a as u8;
-                    let b = read8(ctx, addr);
                     self.regs.p.set_z(a & b == 0);
                     set_nv!($opr, b, u8);
                 } else {
-                    let addr = addr!($opr, u16);
+                    let b = rd!($opr, u16);
                     let a = self.regs.a;
-                    let b = read16(ctx, addr);
                     self.regs.p.set_z(a & b == 0);
                     set_nv!($opr, b, u8);
                 }
@@ -648,20 +685,14 @@ impl Cpu {
                 let disp = self.fetch16(ctx);
                 self.regs.pc = self.regs.pc.wrapping_add(disp);
             }};
-            (jmp far) => {{
-                let addr = self.fetch24(ctx);
-                self.regs.pc = addr as u16;
-                self.regs.pb = (addr >> 16) as u8;
-            }};
-            (jmp aif) => {{
-                let addr = self.fetch16(ctx) as u32;
-                let addr = read24(ctx, addr);
-                self.regs.pc = addr as u16;
-                self.regs.pb = (addr >> 16) as u8;
+            (jmp abs) => {{
+                let addr = self.fetch16(ctx);
+                self.regs.pc = addr;
             }};
             (jmp $addr:ident) => {{
-                let addr = addr!($addr);
+                let addr = addr!($addr).unwrap();
                 self.regs.pc = addr as u16;
+                self.regs.pb = (addr >> 16) as u8;
             }};
 
             (jsr far) => {{
@@ -672,7 +703,7 @@ impl Cpu {
                 self.regs.pc = addr as u16;
             }};
             (jsr $addr:ident) => {{
-                let addr = addr!($addr);
+                let addr = addr!($addr).unwrap();
                 self.push16(ctx, self.regs.pc.wrapping_sub(1));
                 self.regs.pc = addr as u16;
             }};
@@ -791,8 +822,8 @@ impl Cpu {
                 let sb = self.fetch8(ctx);
                 self.regs.db = db;
 
-                let v = read8(ctx, (sb as u32) << 16 | self.regs.x as u32);
-                write8(ctx, (db as u32) << 16 | self.regs.y as u32, v);
+                let v = ctx.read((sb as u32) << 16 | self.regs.x as u32);
+                ctx.write((db as u32) << 16 | self.regs.y as u32, v);
 
                 if is_8bit!(self, x) {
                     self.regs.x = (self.regs.x as u8).wrapping_add($inc as u8) as u16;
@@ -812,16 +843,14 @@ impl Cpu {
         macro_rules! alu {
             ($op:ident, $reg:ident, $opr:ident) => {{
                 if is_8bit!(self, $reg) {
-                    let addr = addr!($opr, u8);
                     let a = reg!($reg) as u8;
-                    let b = read8(ctx, addr);
+                    let b = rd!($opr, u8);
                     let c = alu_op!($op, a, b, u8);
                     self.regs.set_nz(c);
                     set_reg!($reg, c);
                 } else {
-                    let addr = addr!($opr, u16);
                     let a = reg!($reg);
-                    let b = read16(ctx, addr);
+                    let b = rd!($opr, u16);
                     let c = alu_op!($op, a, b, u16);
                     self.regs.set_nz(c);
                     set_reg!($reg, c);
@@ -832,16 +861,14 @@ impl Cpu {
         macro_rules! cmp {
             ($reg:ident, $opr:ident) => {{
                 if is_8bit!(self, $reg) {
-                    let addr = addr!($opr, u8);
                     let a = reg!($reg) as u8;
-                    let b = read8(ctx, addr);
+                    let b = rd!($opr, u8);
                     let (c, carry) = a.overflowing_sub(b);
                     self.regs.set_nz(c);
                     self.regs.p.set_c(!carry);
                 } else {
-                    let addr = addr!($opr, u16);
                     let a = reg!($reg);
-                    let b = read16(ctx, addr);
+                    let b = rd!($opr, u16);
                     let (c, carry) = a.overflowing_sub(b);
                     self.regs.set_nz(c);
                     self.regs.p.set_c(!carry);
@@ -977,11 +1004,11 @@ impl Cpu {
             ($op:ident, $addrmode:ident) => {{
                 let addr = addr!($addrmode);
                 if is_8bit!(self, mem) {
-                    let v = read8(ctx, addr);
-                    write8(ctx, addr, modop!($op, v, u8));
+                    let v = addr.read8(ctx);
+                    addr.write8(ctx, modop!($op, v, u8));
                 } else {
-                    let v = read16(ctx, addr);
-                    write16(ctx, addr, modop!($op, v, u16));
+                    let v = addr.read16(ctx);
+                    addr.write16(ctx, modop!($op, v, u16));
                 }
             }};
         }
@@ -1094,95 +1121,148 @@ impl Cpu {
             (d, $v:expr) => {{ let v = $v; self.regs.set_d(v); }};
         }
 
-        // FIXME: add one cycle for crossing a page boundary
-        macro_rules! addr {
-            (imm, u8) => {{
-                let addr = self.regs.pc24();
-                self.regs.pc = self.regs.pc.wrapping_add(1);
-                addr
-            }};
-            (imm, u16) => {{
-                let addr = self.regs.pc24();
-                self.regs.pc = self.regs.pc.wrapping_add(2);
-                addr
-            }};
-
-            ($addrmode:ident, $_:ty) => {
-                addr!($addrmode)
+        macro_rules! rd {
+            (imm, u8) => {
+                self.fetch8(ctx)
             };
+            (imm, u16) => {
+                self.fetch16(ctx)
+            };
+            ($addrmode:ident, u8) => {
+                addr!($addrmode).read8(ctx)
+            };
+            ($addrmode:ident, u16) => {
+                addr!($addrmode).read16(ctx)
+            };
+            ($addrmode:ident, u24) => {
+                addr!($addrmode).read24(ctx)
+            };
+        }
+
+        macro_rules! wr {
+            ($addrmode:ident, $data:expr, u8) => {
+                addr!($addrmode).write8(ctx, $data)
+            };
+            ($addrmode:ident, $data:expr, u16) => {
+                addr!($addrmode).write16(ctx, $data)
+            };
+        }
+
+        macro_rules! addr {
+            (abs) => {{
+                let offset = self.fetch16(ctx);
+                Wrap24Addr(((self.regs.db as u32) << 16) | offset as u32)
+            }};
+            (abx) => {
+                addr!(abs).offset(self.regs.x as u32)
+            };
+            (aby) => {
+                addr!(abs).offset(self.regs.y as u32)
+            };
+
+            (abi) => {{
+                let addr = Wrap16Addr(self.fetch16(ctx) as u32);
+                Wrap16Addr((self.regs.pb as u32) << 16 | addr.read16(ctx) as u32)
+            }};
+            (aif) => {{
+                let addr = Wrap16Addr(self.fetch16(ctx) as u32);
+                Wrap16Addr(addr.read24(ctx))
+            }};
+            (aix) => {{
+                let addr = Wrap16Addr((self.regs.pb as u32) << 16 | self.fetch16(ctx) as u32);
+                Wrap16Addr((self.regs.pb as u32) << 16 | addr.read16(ctx) as u32)
+            }};
 
             (zp) => {{
                 let offset = self.fetch8(ctx);
-                self.regs.d.wrapping_add(offset as u16) as u32
+                if self.regs.e && self.regs.d & 0xFF == 0 {
+                    // This case muse be used for 8bit access, so wrapping is not important.
+                    Wrap16Addr(self.regs.d as u32 | offset as u32)
+                } else {
+                    Wrap16Addr(self.regs.d as u32).offset(offset as u16)
+                }
             }};
             (zpx) => {{
                 let offset = self.fetch8(ctx);
-                self.regs
-                    .d
-                    .wrapping_add(offset as u16)
-                    .wrapping_add(self.regs.x) as u32
+                if self.regs.e && self.regs.d & 0xFF == 0 {
+                    // This case muse be used for 8bit access, so wrapping is not important.
+                    Wrap16Addr(self.regs.d as u32 | offset.wrapping_add(self.regs.x as u8) as u32)
+                } else {
+                    Wrap16Addr(self.regs.d as u32)
+                        .offset(offset as u16)
+                        .offset(self.regs.x)
+                }
             }};
             (zpy) => {{
                 let offset = self.fetch8(ctx);
-                self.regs
-                    .d
-                    .wrapping_add(offset as u16)
-                    .wrapping_add(self.regs.y) as u32
+                if self.regs.e && self.regs.d & 0xFF == 0 {
+                    // This case muse be used for 8bit access, so wrapping is not important.
+                    Wrap16Addr(self.regs.d as u32 | offset.wrapping_add(self.regs.y as u8) as u32)
+                } else {
+                    Wrap16Addr(self.regs.d as u32)
+                        .offset(offset as u16)
+                        .offset(self.regs.y)
+                }
             }};
-            (inf) => {{
-                let addr = addr!(zp);
-                read24(ctx, addr)
-            }};
-            (ify) => {{
-                let addr = addr!(zp);
-                read24(ctx, addr).wrapping_add(self.regs.y as u32)
-            }};
-            (sp) => {{
-                let offset = self.fetch8(ctx) as u16;
-                self.regs.s.wrapping_add(offset) as u32
-            }};
-            (siy) => {{
-                let addr = addr!(sp);
-                read16(ctx, addr).wrapping_add(self.regs.y) as u32
-            }};
-            (abs) => {{
-                let offset = self.fetch16(ctx);
-                ((self.regs.db as u32) << 16) | offset as u32
-            }};
-            (abx) => {{
-                let offset = self.fetch16(ctx);
-                ((self.regs.db as u32) << 16) | offset.wrapping_add(self.regs.x) as u32
-            }};
-            (aby) => {{
-                let offset = self.fetch16(ctx);
-                ((self.regs.db as u32) << 16) | offset.wrapping_add(self.regs.y) as u32
-            }};
-            (abi) => {{
-                let addr = self.fetch16(ctx) as u32;
-                read16(ctx, addr) as u32
-            }};
-            (aix) => {{
-                let addr = self.fetch16(ctx).wrapping_add(self.regs.x);
-                read16(ctx, (self.regs.pb as u32) << 16 | (addr as u32)) as u32
-            }};
+
             (ind) => {{
-                let addr = addr!(zp);
-                read16(ctx, addr) as u32
+                let addr = addr!(zp).read16(ctx);
+                Wrap24Addr((self.regs.db as u32) << 16 | addr as u32)
             }};
+            (inf) => {
+                Wrap24Addr(addr!(zp).read24(ctx))
+            };
             (inx) => {{
-                let addr = addr!(zpx);
-                read16(ctx, addr) as u32
+                let offset = self.fetch8(ctx);
+                let addr = if self.regs.e && self.regs.d & 0xFF == 0 {
+                    Wrap8Addr(self.regs.d as u32 | offset.wrapping_add(self.regs.x as u8) as u32)
+                        .read16(ctx)
+                } else {
+                    Wrap16Addr(self.regs.d as u32)
+                        .offset(offset as u16)
+                        .offset(self.regs.x)
+                        .read16(ctx)
+                };
+                Wrap24Addr((self.regs.db as u32) << 16 | addr as u32)
             }};
             (iny) => {{
-                let addr = addr!(zp);
-                read16(ctx, addr).wrapping_add(self.regs.y) as u32
+                let offset = self.fetch8(ctx);
+                let addr = if self.regs.e && self.regs.d & 0xFF == 0 {
+                    Wrap8Addr(self.regs.d as u32 | offset as u32).read16(ctx)
+                } else {
+                    Wrap16Addr(self.regs.d as u32)
+                        .offset(offset as u16)
+                        .read16(ctx)
+                };
+                Wrap24Addr((self.regs.db as u32) << 16 | addr as u32).offset(self.regs.y as u32)
             }};
+            (ify) => {{
+                let offset = self.fetch8(ctx);
+                let addr = if self.regs.e && self.regs.d & 0xFF == 0 {
+                    Wrap8Addr(self.regs.d as u32 | offset as u32).read24(ctx)
+                } else {
+                    Wrap16Addr(self.regs.d as u32)
+                        .offset(offset as u16)
+                        .read24(ctx)
+                };
+                Wrap24Addr(addr).offset(self.regs.y as u32)
+            }};
+
             (far) => {
-                self.fetch24(ctx)
+                Wrap24Addr(self.fetch24(ctx))
             };
             (fax) => {
-                addr!(far).wrapping_add(self.regs.x as u32)
+                Wrap24Addr(self.fetch24(ctx)).offset(self.regs.x as u32)
             };
+
+            (sp) => {{
+                let offset = self.fetch8(ctx) as u16;
+                Wrap16Addr(self.regs.s.wrapping_add(offset) as u32)
+            }};
+            (siy) => {{
+                let addr = addr!(sp).read16(ctx);
+                Wrap24Addr((self.regs.db as u32) << 16 | addr as u32).offset(self.regs.y as u32)
+            }};
         }
 
         match_opcode!(opcode, exec_instr);
