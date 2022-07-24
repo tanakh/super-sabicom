@@ -1169,7 +1169,8 @@ impl Cpu {
                 Wrap16Addr(addr.read24(ctx))
             }};
             (aix) => {{
-                let addr = Wrap16Addr((self.regs.pb as u32) << 16 | self.fetch16(ctx) as u32);
+                let offset = self.fetch16(ctx).wrapping_add(self.regs.x);
+                let addr = Wrap16Addr((self.regs.pb as u32) << 16 | offset as u32);
                 Wrap16Addr((self.regs.pb as u32) << 16 | addr.read16(ctx) as u32)
             }};
 
