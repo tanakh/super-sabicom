@@ -10,13 +10,12 @@ pub struct Rom {
     pub map_mode: MapMode,
     pub chipset: Chipset,
     pub rom_size: usize,
-    pub ram_size: usize,
+    pub sram_size: usize,
     pub country: u8,
     pub developer_id: u8,
     pub game_code: Option<[u8; 4]>,
     pub rom_version: u8,
     pub rom: Vec<u8>,
-    pub sram: Vec<u8>,
 }
 
 #[derive(Debug)]
@@ -62,14 +61,14 @@ impl From<u8> for MapMode {
 
 #[derive(Default, Debug)]
 pub struct Chipset {
-    code: u8,
-    subclass: u8,
-    is_valid: bool,
-    has_rom: bool,
-    has_ram: bool,
-    has_battery: bool,
-    has_rtc: bool,
-    coprocessor: Option<Coprocessor>,
+    pub code: u8,
+    pub subclass: u8,
+    pub is_valid: bool,
+    pub has_rom: bool,
+    pub has_ram: bool,
+    pub has_battery: bool,
+    pub has_rtc: bool,
+    pub coprocessor: Option<Coprocessor>,
 }
 
 impl Display for Chipset {
@@ -232,10 +231,13 @@ impl Rom {
             Err(RomError::InvalidRomSize)?
         };
 
-        let (header_pos_first, rom) = if let Ok(rom) = try_from_bytes(bytes, 0x7F00) {
+        let (header_pos_first, rom) = if let Ok(rom) = try_from_bytes(bytes, 0x7F00, true) {
             (true, rom)
+        } else if let Ok(rom) = try_from_bytes(bytes, 0xFF00, true) {
+            (false, rom)
         } else {
-            (false, try_from_bytes(bytes, 0xFF00)?)
+            // Fallback to LoROM
+            (true, try_from_bytes(bytes, 0x7F00, false)?)
         };
 
         if header_pos_first != matches!(rom.map_mode, MapMode::LoRom) {
@@ -246,84 +248,28 @@ impl Rom {
 
         Ok(rom)
     }
-
-    pub fn read(&self, addr: u32) -> u8 {
-        match self.map_mode {
-            MapMode::LoRom => {
-                let bank = addr >> 16;
-
-                if self.rom.len() > 0x40 * 0x8000 {
-                    // The older boards map SRAM to the whole 64K areas at banks 70h-7Dh/F0-FFh.
-                    // The newer boards map SRAM to the lower 32K areas at banks 70h-7Dh/F0-FFh (this allows "BigLoROM" games to use the upper 32K of that banks as additional LoROM banks, which is required for games with more than 3MB LoROM).
-                    todo!("Support LoROM larger than 2MB");
-                }
-
-                if !self.chipset.has_ram || bank & 0x7F < 0x70 {
-                    let rom_addr = (bank & 0x3F) << 15 | addr & 0x7FFF;
-                    self.rom[rom_addr as usize]
-                } else {
-                    let sram_addr = (bank & 0xF) << 15 | addr & 0x7FFF;
-                    self.sram[sram_addr as usize]
-                }
-            }
-            MapMode::HiRom => {
-                let bank = addr >> 16;
-
-                if bank & 0x40 != 0 || addr & 0x8000 != 0 {
-                    let rom_addr = (bank & 0x3F) << 16 | addr & 0xFFFF;
-                    self.rom[rom_addr as usize]
-                } else if bank & 0x20 == 0x20 && addr & 0x6000 == 0x6000 {
-                    let sram_addr = (bank & 0x1F) << 13 | addr & 0x1FFF;
-                    self.sram[sram_addr as usize]
-                } else {
-                    panic!("Unmapped HiROM region {:02X}:{:04X}", bank, addr & 0xFFFF);
-                }
-            }
-            _ => todo!("Map mode: {:?}", self.map_mode),
-        }
-    }
-
-    pub fn write(&mut self, addr: u32, data: u8) {
-        match self.map_mode {
-            MapMode::LoRom => {
-                let bank = addr >> 16;
-
-                if !self.chipset.has_ram && bank & 0x7F < 0x70 {
-                    panic!("Write to SRAM with no SRAM cartridge");
-                } else {
-                    let sram_addr = (bank & 0xF) << 15 | addr & 0x7FFF;
-                    self.sram[sram_addr as usize] = data;
-                }
-            }
-            MapMode::HiRom => {
-                let bank = addr >> 16;
-
-                if bank & 0x40 != 0 || addr & 0x8000 != 0 {
-                    let rom_addr = (bank & 0x3F) << 16 | addr & 0xFFFF;
-                    self.rom[rom_addr as usize] = data;
-                } else if bank & 0x20 == 0x20 && addr & 0x6000 == 0x6000 {
-                    let sram_addr = (bank & 0x1F) << 13 | addr & 0x1FFF;
-                    self.sram[sram_addr as usize] = data;
-                } else {
-                    panic!("Unmapped HiROM region {:02X}:{:04X}", bank, addr & 0xFFFF);
-                }
-            }
-            _ => todo!("Map mode: {:?}", self.map_mode),
-        }
-    }
 }
 
-fn try_from_bytes(bytes: &[u8], header_pos: usize) -> Result<Rom, RomError> {
+fn try_from_bytes(bytes: &[u8], header_pos: usize, strict: bool) -> Result<Rom, RomError> {
     if header_pos + 0x100 > bytes.len() {
         Err(RomError::UnknownRomType)?
     }
     let header = &bytes[header_pos..header_pos + 0x100];
 
     let title = header[0xC0..=0xD4].to_vec();
-    if !title.iter().all(|&b| {
-        b.is_ascii_uppercase() || b.is_ascii_digit() || b.is_ascii_punctuation() || b == b' '
-    }) {
-        Err(RomError::InvalidTitleString)?
+    eprintln!("{:?}", String::from_utf8_lossy(&title));
+    if !title
+        .iter()
+        .all(|&b| b.is_ascii_alphanumeric() || b.is_ascii_punctuation() || b == b' ')
+    {
+        if strict {
+            Err(RomError::InvalidTitleString)?
+        } else {
+            warn!(
+                "Invalid title string: {:?}",
+                String::from_utf8_lossy(&title)
+            );
+        }
     }
 
     let v = header[0xD5];
@@ -345,14 +291,11 @@ fn try_from_bytes(bytes: &[u8], header_pos: usize) -> Result<Rom, RomError> {
     }
 
     let rom_size_code = header[0xD7];
-    if rom_size_code == 0 || rom_size_code >= 0xD {
+    if rom_size_code >= 0xD {
         todo!("Too large rom size in header: {rom_size_code}");
     }
 
-    // Number of banks (bank = 32KB)
-    const ROM_SIZE_TABLE: &[usize] = &[0, 1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 64, 128];
-
-    let rom_size = ROM_SIZE_TABLE[rom_size_code as usize] * 32 * 1024;
+    let rom_size = (1 << rom_size_code) * 1024;
     if !(rom_size / 2 + 1..=rom_size).contains(&bytes.len()) {
         warn!(
             "ROM size does not match with headers info: expected: {rom_size}, actual: {}",
@@ -372,7 +315,7 @@ fn try_from_bytes(bytes: &[u8], header_pos: usize) -> Result<Rom, RomError> {
         warn!("Too large ram size in header: {ram_size_code:#04X}");
     }
 
-    let ram_size = if ram_size_code == 0 {
+    let sram_size = if ram_size_code == 0 {
         0
     } else {
         if !chipset.has_ram {
@@ -401,13 +344,12 @@ fn try_from_bytes(bytes: &[u8], header_pos: usize) -> Result<Rom, RomError> {
         map_mode,
         chipset,
         rom_size,
-        ram_size,
+        sram_size,
         country,
         developer_id,
         game_code,
         rom_version,
         rom: bytes.to_vec(),
-        sram: vec![0; ram_size],
     })
 }
 

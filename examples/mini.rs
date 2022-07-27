@@ -7,18 +7,21 @@ use std::{
 use anyhow::{anyhow, bail, Result};
 use compress_tools::{list_archive_files, uncompress_archive_file};
 use log::info;
-use meru_interface::{EmulatorCore, InputData};
+use meru_interface::{
+    key_assign::{InputState, KeyCode, SingleKey},
+    EmulatorCore,
+};
 use sdl2::{
     audio::{AudioQueue, AudioSpecDesired},
     controller::{Button, GameController},
     event::Event,
-    keyboard::{KeyboardState, Keycode, Scancode},
+    keyboard::{Keycode, Scancode},
     pixels::Color,
     surface::Surface,
     EventPump,
 };
 
-use super_sabicom::{Rom, Snes, SnesConfig};
+use super_sabicom::Snes;
 
 #[argopt::cmd]
 fn main(rom: PathBuf) -> Result<()> {
@@ -36,17 +39,6 @@ fn main(rom: PathBuf) -> Result<()> {
             )
         })
         .init();
-
-    // let data = load_rom(&rom)?;
-    // let rom = Rom::from_bytes(&data)?;
-    // print_rom_info(&rom);
-
-    // let mut snes = Snes::new(rom);
-
-    // loop {
-    //     use meru_interface::EmulatorCore;
-    //     snes.exec_frame(true);
-    // }
 
     run(&rom)
 }
@@ -114,8 +106,12 @@ fn save_backup(rom_path: &Path, backup: Vec<u8>) -> Result<()> {
 }
 
 fn print_game_info(snes: &Snes) {
+    let game_info = snes.game_info();
+
+    let field_len = game_info.iter().map(|r| r.0.len()).max().unwrap();
+
     for (desc, value) in snes.game_info() {
-        println!("{}: {}", desc, value);
+        println!("{desc:field_len$}: {value}");
     }
 }
 
@@ -128,6 +124,8 @@ fn run(rom_path: &Path) -> Result<()> {
     let mut snes = Snes::try_from_file(&bytes, None, &Default::default())?;
 
     print_game_info(&snes);
+
+    let key_config = Snes::default_key_config();
 
     let sdl_context = sdl2::init().unwrap();
     let video_subsystem = sdl_context.video().unwrap();
@@ -155,11 +153,11 @@ fn run(rom_path: &Path) -> Result<()> {
     )
     .unwrap();
 
-    const SOUND_BUF_LEN: u16 = 2048;
+    const SOUND_BUF_LEN: u16 = 1024;
 
     let audio_subsystem = sdl_context.audio().map_err(|e| anyhow!("{e}"))?;
     let desired_spec = AudioSpecDesired {
-        freq: Some(48000),
+        freq: Some(32000),
         channels: Some(2),
         samples: Some(SOUND_BUF_LEN),
     };
@@ -201,7 +199,7 @@ fn run(rom_path: &Path) -> Result<()> {
             info!("State save slot changed: {cur_slot}");
         }
 
-        let key_input = im.key_input();
+        let key_input = key_config.input(&im);
         snes.set_input(&key_input);
         snes.exec_frame(true);
 
@@ -225,13 +223,13 @@ fn run(rom_path: &Path) -> Result<()> {
         canvas.present();
 
         let audio_buf = snes.audio_buffer();
-        // assert!(
-        //     (799..=801).contains(&audio_buf.len()),
-        //     "invalid generated audio length: {}",
-        //     audio_buf.len()
-        // );
+        assert!(
+            (532..=534).contains(&audio_buf.samples.len()),
+            "invalid generated audio length: {}",
+            audio_buf.samples.len()
+        );
 
-        // Sync by audio
+        // Sync to audio
         while audio_queue.size() > SOUND_BUF_LEN as u32 * 4 {
             std::thread::sleep(Duration::from_millis(1));
         }
@@ -283,27 +281,13 @@ fn process_events(event_pump: &mut EventPump) -> bool {
 }
 
 struct InputManager {
+    pressed_scancodes: Vec<Scancode>,
     controllers: Vec<GameController>,
-    key_bind: Vec<(Key, KeyBind)>,
-    cur_key_input: Vec<bool>,
+    // key_bind: Vec<(Key, KeyBind)>,
+    // cur_key_input: Vec<bool>,
     hotkey: Vec<(HotKey, KeyBind)>,
     cur_hotkey: Vec<bool>,
     prev_hotkey: Vec<bool>,
-}
-
-enum Key {
-    A,
-    B,
-    X,
-    Y,
-    R,
-    L,
-    Select,
-    Start,
-    Right,
-    Left,
-    Up,
-    Down,
 }
 
 #[derive(PartialEq, Eq)]
@@ -327,12 +311,6 @@ macro_rules! kbd {
     };
 }
 
-macro_rules! pad {
-    ($button:ident) => {
-        KeyBind::Button(Button::$button)
-    };
-}
-
 impl std::ops::BitOr for KeyBind {
     type Output = KeyBind;
 
@@ -350,24 +328,6 @@ macro_rules! def_key_bind {
     };
 }
 
-fn default_key_bind() -> Vec<(Key, KeyBind)> {
-    use Key::*;
-    def_key_bind! {
-        A => kbd!(X) | pad!(B),
-        B => kbd!(Z) | pad!(A),
-        X => kbd!(S) | pad!(Y),
-        Y => kbd!(A) | pad!(X),
-        R => kbd!(W) | pad!(RightShoulder),
-        L => kbd!(Q) | pad!(LeftShoulder),
-        Select => kbd!(RShift) | pad!(Back),
-        Start => kbd!(Return) | pad!(Start),
-        Right => kbd!(Right) | pad!(DPadRight),
-        Left => kbd!(Left) | pad!(DPadLeft),
-        Up => kbd!(Up) | pad!(DPadUp),
-        Down => kbd!(Down) | pad!(DPadDown),
-    }
-}
-
 fn default_hotkey() -> Vec<(HotKey, KeyBind)> {
     use HotKey::*;
     def_key_bind! {
@@ -380,13 +340,14 @@ fn default_hotkey() -> Vec<(HotKey, KeyBind)> {
 
 impl InputManager {
     fn new(controllers: Vec<GameController>) -> Self {
-        let key_bind = default_key_bind();
+        // let key_bind = default_key_bind();
         let hotkey = default_hotkey();
 
         Self {
+            pressed_scancodes: vec![],
             controllers,
-            cur_key_input: vec![false; key_bind.len()],
-            key_bind,
+            // cur_key_input: vec![false; key_bind.len()],
+            // key_bind,
             cur_hotkey: vec![false; hotkey.len()],
             prev_hotkey: vec![false; hotkey.len()],
             hotkey,
@@ -396,52 +357,17 @@ impl InputManager {
     fn update(&mut self, e: &EventPump) {
         let ks = e.keyboard_state();
 
-        for (i, (_, key_bind)) in self.key_bind.iter().enumerate() {
-            self.cur_key_input[i] = self.pressed(&ks, key_bind);
-        }
+        self.pressed_scancodes = ks.pressed_scancodes().collect();
 
-        self.prev_hotkey.copy_from_slice(&self.cur_hotkey);
+        // for (i, (_, key_bind)) in self.key_bind.iter().enumerate() {
+        //     self.cur_key_input[i] = self.pressed(&ks, key_bind);
+        // }
 
-        for (i, (_, key_bind)) in self.hotkey.iter().enumerate() {
-            self.cur_hotkey[i] = self.pressed(&ks, key_bind);
-        }
-    }
+        // self.prev_hotkey.copy_from_slice(&self.cur_hotkey);
 
-    fn pressed(&self, ks: &KeyboardState, key_bind: &KeyBind) -> bool {
-        match key_bind {
-            KeyBind::Scancode(sc) => ks.is_scancode_pressed(*sc),
-            KeyBind::Button(button) => match self.controllers.get(0) {
-                Some(c) => c.button(*button),
-                _ => false,
-            },
-            KeyBind::And(keys) => keys.iter().all(|key| self.pressed(ks, key)),
-            KeyBind::Or(keys) => keys.iter().any(|key| self.pressed(ks, key)),
-        }
-    }
-
-    fn key_input(&self) -> InputData {
-        let mut ret = InputData::default();
-
-        for (i, (key, _)) in self.key_bind.iter().enumerate() {
-            let name = match key {
-                Key::A => "A",
-                Key::B => "B",
-                Key::X => "X",
-                Key::Y => "Y",
-                Key::R => "R",
-                Key::L => "L",
-                Key::Select => "Select",
-                Key::Start => "Start",
-                Key::Right => "Right",
-                Key::Left => "Left",
-                Key::Up => "Up",
-                Key::Down => "Down",
-            };
-
-            ret.inputs.push((name.into(), self.cur_key_input[i]));
-        }
-
-        ret
+        // for (i, (_, key_bind)) in self.hotkey.iter().enumerate() {
+        //     self.cur_hotkey[i] = self.pressed(&ks, key_bind);
+        // }
     }
 
     fn hotkey_pressed(&self, hotkey: HotKey) -> bool {
@@ -451,5 +377,45 @@ impl InputManager {
             }
         }
         false
+    }
+}
+
+impl InputState for InputManager {
+    fn pressed(&self, key: &SingleKey) -> bool {
+        match key {
+            SingleKey::KeyCode(code) => self
+                .pressed_scancodes
+                .iter()
+                .any(|sc| eq_scancode(sc, code)),
+            SingleKey::GamepadButton(_) => todo!(),
+            SingleKey::GamepadAxis(_, _) => todo!(),
+        }
+    }
+
+    fn just_pressed(&self, key: &SingleKey) -> bool {
+        todo!()
+    }
+}
+
+fn eq_scancode(scancode: &Scancode, keycode: &KeyCode) -> bool {
+    let rsc = keycode_to_scancode(keycode);
+    scancode == &rsc
+}
+
+fn keycode_to_scancode(keycode: &KeyCode) -> Scancode {
+    match keycode {
+        KeyCode::Return => Scancode::Return,
+        KeyCode::LShift => Scancode::RShift,
+        KeyCode::X => Scancode::X,
+        KeyCode::Z => Scancode::Z,
+        KeyCode::S => Scancode::S,
+        KeyCode::A => Scancode::A,
+        KeyCode::Q => Scancode::Q,
+        KeyCode::W => Scancode::W,
+        KeyCode::Up => Scancode::Up,
+        KeyCode::Down => Scancode::Down,
+        KeyCode::Left => Scancode::Left,
+        KeyCode::Right => Scancode::Right,
+        _ => todo!(),
     }
 }

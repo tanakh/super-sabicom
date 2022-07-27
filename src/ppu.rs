@@ -1,7 +1,7 @@
 #![allow(unused_braces)]
 
 use educe::Educe;
-use log::debug;
+use log::{debug, warn};
 use meru_interface::{FrameBuffer, Pixel};
 use modular_bitfield::prelude::*;
 
@@ -41,6 +41,7 @@ pub struct Ppu {
     vram: Vec<u8>,
     vram_addr_inc_mode: VramAddrIncMode,
     vram_addr: u16,
+    vram_prefetch: [u8; 2],
 
     #[educe(Default(expression = "vec![0; 0x220]"))]
     oam: Vec<u8>,
@@ -58,6 +59,8 @@ pub struct Ppu {
     counter: u64,
     hblank: bool,
     vblank: bool,
+    obj_range_overflow: bool,
+    obj_time_overflow: bool,
     hdma_reload: bool,
     hdma_transfer: bool,
 
@@ -468,10 +471,15 @@ impl Ppu {
                     self.frame += 1;
                     debug!("Start Frame: {}", self.frame);
 
-                    // clear vblank flag, reset NMI flag
-                    // TODO: clear vblank flag
+                    // End of VBlank
+
                     self.vblank = false;
                     ctx.interrupt_mut().set_nmi_flag(false);
+
+                    if !self.display_ctrl.force_blank() {
+                        self.obj_range_overflow = false;
+                        self.obj_time_overflow = false;
+                    }
                 }
 
                 debug!("Line: {}:{}", self.frame, self.y);
@@ -546,8 +554,30 @@ impl Ppu {
                 0
             }
             // 0x2138 - RDOAM   - "PPU1 OAM Data Read            (read-twice)"
+            0x2138 => {
+                let ret = if self.oam_addr_internal < 0x200 {
+                    self.oam[self.oam_addr_internal as usize]
+                } else {
+                    // addresses 220h..3FFh are mirrors of 200h..21Fh
+                    self.oam[self.oam_addr_internal as usize & 0x21F]
+                };
+                self.oam_addr_internal = (self.oam_addr_internal + 1) & 0x3FF;
+                ret
+            }
             // 0x2139 - RDVRAML - "PPU1 VRAM Data Read           (lower 8bits)"
             // 0x213A - RDVRAMH - "PPU1 VRAM Data Read           (upper 8bits)"
+            0x2139 | 0x213A => {
+                let ofs = (addr - 0x2139) as usize;
+                let ret = self.vram_prefetch[ofs];
+                if self.vram_addr_inc_mode.inc_after_high_byte() == (ofs == 1) {
+                    // Prefetch BEFORE incrementing vram address
+                    self.vram_prefetch[0] = self.vram[(self.vram_addr * 2) as usize + ofs];
+                    self.vram_prefetch[1] = self.vram[(self.vram_addr * 2 + 1) as usize + ofs];
+                    self.vram_addr =
+                        (self.vram_addr + self.vram_addr_inc_mode.inc_words()) & 0x7FFF;
+                }
+                ret
+            }
             // 0x213B - RDCGRAM - "PPU2 CGRAM Data Read (Palette)(read-twice)"
             0x213B => {
                 let word = self.cgram[self.cgram_addr as usize / 2];
@@ -582,6 +612,25 @@ impl Ppu {
                 }
             }
             // 0x213E - STAT77  - "PPU1 Status and PPU1 Version Number"
+            0x213E => {
+                let mut ret = 0;
+
+                const PPU1_VERSION: u8 = 1;
+                const PPU1_MASTER: u8 = 0;
+
+                // 3-0  PPU1 5C77 Version Number (only version 1 exists as far as I know)
+                ret |= PPU1_VERSION;
+                // FIXME:
+                // 4    Not used (PPU1 open bus) (same as last value read from PPU1)
+                // 5    Master/Slave Mode (PPU1.Pin25) (0=Normal=Master)
+                ret |= PPU1_MASTER << 5;
+                // 6    OBJ Range overflow (0=Okay, 1=More than 32 OBJs per scanline)
+                ret |= (self.obj_range_overflow as u8) << 6;
+                // 7    OBJ Time overflow  (0=Okay, 1=More than 8x34 OBJ pixels per scanline)
+                ret |= (self.obj_time_overflow as u8) << 7;
+
+                ret
+            }
             // 0x213F - STAT78  - "PPU2 Status and PPU2 Version Number"
             0x213F => {
                 let mut ret = 0;
@@ -600,6 +649,13 @@ impl Ppu {
 
                 ret
             }
+
+            0x2115 | 0x2120 | 0x2121 => {
+                // FIXME: Open-bus
+                warn!("PPU Read: {addr:04X}");
+                0
+            }
+
             _ => todo!("PPU Read: {addr:04X}"),
         }
     }
@@ -660,8 +716,16 @@ impl Ppu {
                 }
             }
             0x2115 => self.vram_addr_inc_mode.bytes[0] = data,
-            0x2116 => self.vram_addr = self.vram_addr & 0x7F00 | data as u16,
-            0x2117 => self.vram_addr = self.vram_addr & 0x00FF | ((data & 0x7F) as u16) << 8,
+            0x2116 => {
+                self.vram_addr = self.vram_addr & 0x7F00 | data as u16;
+                self.vram_prefetch[0] = self.vram[(self.vram_addr * 2) as usize];
+                self.vram_prefetch[1] = self.vram[(self.vram_addr * 2 + 1) as usize];
+            }
+            0x2117 => {
+                self.vram_addr = self.vram_addr & 0x00FF | ((data & 0x7F) as u16) << 8;
+                self.vram_prefetch[0] = self.vram[(self.vram_addr * 2) as usize];
+                self.vram_prefetch[1] = self.vram[(self.vram_addr * 2 + 1) as usize];
+            }
             0x2118 | 0x2119 => {
                 let ofs = addr - 0x2118;
                 let vram_addr = self.vram_addr_inc_mode.translate(self.vram_addr);
@@ -669,6 +733,7 @@ impl Ppu {
                 if self.vram_addr_inc_mode.inc_after_high_byte() == (ofs == 1) {
                     self.vram_addr =
                         (self.vram_addr + self.vram_addr_inc_mode.inc_words()) & 0x7FFF;
+                    // Does not prefetch
                 }
             }
             0x211A => self.rot_setting.bytes[0] = data,
@@ -755,7 +820,10 @@ impl Ppu {
                 }
             }
             0x2133 => self.display_ctrl.bytes[1] = data,
-            _ => todo!("PPU Write: {addr:#06X} = {data:#04X}"),
+
+            0x2134..=0x213F => warn!("Write to readonly register: {addr:04X} = {data:#04X}"),
+
+            _ => unreachable!(""),
         }
     }
 }
@@ -929,7 +997,7 @@ impl Ppu {
         // 10: OBJ.0    OBJ.0    OBJ.0    OBJ.0    OBJ.0    OBJ.0    OBJ.0    OBJ.0
         // 11: BG3.0    BG3.0a   BG2.0    BG2.0    BG2.0    BG2.0    -        BG2.0p
         // 12: BG4.0    BG3.0b   -        -        -        -        -        -
-        // FF: Backdrop Backdrop Backdrop Backdrop Backdrop Backdrop Backdrop Backdrop
+        // 15: Backdrop Backdrop Backdrop Backdrop Backdrop Backdrop Backdrop Backdrop
 
         match self.bg_mode.mode() {
             0 => {
@@ -971,18 +1039,31 @@ impl Ppu {
     }
 
     fn render_bg(&mut self, y: u32, i: usize, bpp: usize, zl: u8, zh: u8, pal_base: u8) {
+        if !self.bg_mode.tile_size(i) {
+            self.render_bg_::<8>(y, i, bpp, zl, zh, pal_base);
+        } else {
+            self.render_bg_::<16>(y, i, bpp, zl, zh, pal_base);
+        }
+    }
+
+    fn render_bg_<const TILE_SIZE: usize>(
+        &mut self,
+        y: u32,
+        i: usize,
+        bpp: usize,
+        zl: u8,
+        zh: u8,
+        pal_base: u8,
+    ) {
         let enable_main = self.screen_desig_main.bg(i);
         let enable_sub = self.screen_desig_sub.bg(i);
         if !enable_main && !enable_sub {
             return;
         }
+
         let win_calc = self.win_calc_bg(i);
 
-        if self.bg_mode.tile_size(i) {
-            todo!("16 x 16 Tile mode");
-        }
-
-        // FIXME: base_addr is 6bit (0x3F * 2K = 126K), but VRAM is 64KB. ???
+        // FIXME: base_addr is 6bit (0x3F * 2K = 126K), but VRAM is 64KB ???
         let sc_base_addr = self.bg_sc[i].base_addr() as usize * 2 * 1024;
         let tile_base_addr = self.bg_tile_base_addr[i] as usize * 8 * 1024;
 
@@ -1022,10 +1103,10 @@ impl Ppu {
             }
 
             let sx = x as usize + hofs;
-            let sc_x = sx / 8 / 32 % sc_w;
-            let sc_y = sy / 8 / 32 % sc_h;
-            let tile_x = sx / 8 % 32;
-            let tile_y = sy / 8 % 32;
+            let sc_x = sx / TILE_SIZE / 32 % sc_w;
+            let sc_y = sy / TILE_SIZE / 32 % sc_h;
+            let tile_x = sx / TILE_SIZE % 32;
+            let tile_y = sy / TILE_SIZE % 32;
 
             let sc_addr = sc_base_addr + (sc_x + sc_y * sc_w) * SC_SIZE;
             let entry_addr = (sc_addr + (tile_x + tile_y * 32) * 2) & 0xFFFE;
@@ -1033,12 +1114,17 @@ impl Ppu {
             let entry =
                 BgMapEntry::from_bytes(self.vram[entry_addr..entry_addr + 2].try_into().unwrap());
 
+            let pixel_x = (sx % TILE_SIZE) ^ if !entry.x_flip() { 0 } else { TILE_SIZE - 1 };
+            let pixel_y = (sy % TILE_SIZE) ^ if !entry.y_flip() { 0 } else { TILE_SIZE - 1 };
+
             let z = if entry.priority() == 0 { zl } else { zh } * 0x10 + pixel_kind;
 
-            let pixel_x = if !entry.x_flip() { sx % 8 } else { 7 - sx % 8 };
-            let pixel_y = if !entry.y_flip() { sy % 8 } else { 7 - sy % 8 };
+            let char_num =
+                entry.char_num() as usize + pixel_x / 8 + (((pixel_y / 8) * 0x10) & 0x3FF);
+            let pixel_x = pixel_x % 8;
+            let pixel_y = pixel_y % 8;
 
-            let tile_addr = tile_base_addr + entry.char_num() as usize * bpp as usize * 8;
+            let tile_addr = tile_base_addr + char_num * bpp as usize * 8;
 
             let mut pixel = 0;
             for i in 0..bpp / 2 {
@@ -1064,6 +1150,10 @@ impl Ppu {
     }
 
     fn render_bg_mode7(&mut self, y: u32, z: u8) {
+        if self.color_math_ctrl.direct_color() {
+            todo!("Direct color in Mode7");
+        }
+
         let enable_main = self.screen_desig_main.bg(0);
         let enable_sub = self.screen_desig_sub.bg(0);
         if !enable_main && !enable_sub {
@@ -1187,6 +1277,9 @@ impl Ppu {
 
         let win_calc = self.win_calc_obj();
 
+        let mut render_obj = 0;
+        let mut render_block = 0;
+
         for i in 0..128 {
             let i = if !self.oam_addr.priority_rotation() {
                 i
@@ -1202,6 +1295,13 @@ impl Ppu {
             if !(oy..oy + oh).contains(&y) {
                 continue;
             }
+
+            render_obj += 1;
+            if render_obj > 32 {
+                self.obj_range_overflow = true;
+                break;
+            }
+
             let ox = ((extra as usize & 1) << 8) + entry.x() as usize;
             let dy = y - oy;
             let pixel_y = if !entry.y_flip() { dy } else { oh - 1 - dy };
@@ -1256,14 +1356,16 @@ impl Ppu {
                     }
                 }
             }
+
+            render_block += ow / 8;
+            if render_block > 34 {
+                self.obj_time_overflow = true;
+                break;
+            }
         }
     }
 
     fn color_math(&mut self) {
-        if self.color_math_ctrl.direct_color() {
-            todo!("Color math direct color mode");
-        }
-
         let win_calc = self.win_calc_math();
         let master_brightness = self.display_ctrl.master_brightness();
 

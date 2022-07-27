@@ -1,10 +1,11 @@
 #![allow(unused_braces)]
 
-use std::fmt::Display;
+use crate::dsp::Dsp;
 
 use log::{debug, trace, warn, Level};
 use meru_interface::AudioBuffer;
 use modular_bitfield::prelude::*;
+use std::fmt::Display;
 use super_sabicom_macro::opcodes;
 
 use crate::context;
@@ -15,10 +16,10 @@ impl<T: context::Timing> Context for T {}
 pub struct Spc {
     regs: Registers,
     ioregs: IORegisters,
-    ram: Vec<u8>,
-    counter: u64,
+    dsp: Dsp,
 
-    audio_buffer: AudioBuffer,
+    counter: u64,
+    dsp_counter: u64,
 }
 
 impl Default for Spc {
@@ -26,9 +27,9 @@ impl Default for Spc {
         Self {
             regs: Registers::default(),
             ioregs: IORegisters::default(),
-            ram: vec![0; 0x10000],
+            dsp: Dsp::default(),
             counter: 0,
-            audio_buffer: AudioBuffer::default(),
+            dsp_counter: 0,
         }
     }
 }
@@ -91,7 +92,7 @@ impl Registers {
 }
 
 struct IORegisters {
-    timer_enable: bool,
+    timer_enable: bool, // ???
     ram_write_enable: bool,
     crash_spc700: bool, // ???
     ram_wait_cycle: u64,
@@ -100,6 +101,7 @@ struct IORegisters {
     dsp_reg: u8,
     cpuin: [u8; 4],
     cpuout: [u8; 4],
+    ext_io: [u8; 2],
     timer: [Timer; 3],
     counter01: u64,
     counter2: u64,
@@ -125,6 +127,7 @@ impl Default for IORegisters {
             dsp_reg: 0,
             cpuin: [0; 4],
             cpuout: [0; 4],
+            ext_io: [0; 2],
             timer: Default::default(),
             counter01: 0,
             counter2: 0,
@@ -134,7 +137,11 @@ impl Default for IORegisters {
 
 impl Spc {
     pub fn audio_buffer(&self) -> &AudioBuffer {
-        &self.audio_buffer
+        &self.dsp.audio_buffer
+    }
+
+    pub fn clear_audio_buffer(&mut self) {
+        self.dsp.audio_buffer.samples.clear();
     }
 
     pub fn read_port(&self, port: u8) -> u8 {
@@ -153,21 +160,29 @@ impl Spc {
             self.exec_one();
         }
 
-        self.tick_timer(self.counter - start);
+        let elapsed = self.counter - start;
+        self.tick_timer(elapsed);
+
+        self.dsp_counter += elapsed;
+        while self.dsp_counter >= 32 {
+            // 1.024MHz / 32 = 32KHz
+            self.dsp_counter -= 32;
+            self.dsp.tick();
+        }
     }
 
     fn tick_timer(&mut self, elapsed: u64) {
         self.ioregs.counter01 += elapsed;
         self.ioregs.counter2 += elapsed;
 
-        // Timer 0/1 is clocked 8000Hz = 1.024Mhz / 128
+        // Timer 0/1 are clocked 8000Hz = 1.024MHz / 128
         while self.ioregs.counter01 >= 128 {
             self.ioregs.counter01 -= 128;
             for i in 0..2 {
                 self.ioregs.timer[i].tick();
             }
         }
-        // Timer 2 is clocked 64000Hz = 1.024Mhz / 16
+        // Timer 2 is clocked 64000Hz = 1.024MHz / 16
         while self.ioregs.counter2 >= 16 {
             self.ioregs.counter2 -= 16;
             self.ioregs.timer[2].tick();
@@ -239,10 +254,10 @@ impl Spc {
             }
             _ => {
                 self.counter += self.ioregs.ram_wait_cycle;
-                self.ram[addr as usize]
+                self.dsp.ram[addr as usize]
             }
         };
-        trace!("Read:  {addr:#06X} = {data:#04X}");
+        // trace!("Read:  {addr:#06X} = {data:#04X}");
         data
     }
 
@@ -250,14 +265,14 @@ impl Spc {
         Some(match addr {
             0x00F0..=0x00FF => None?,
             0xFFC0..=0xFFFF if self.ioregs.rom_enable => BOOT_ROM[(addr - 0xFFC0) as usize],
-            _ => self.ram[addr as usize],
+            _ => self.dsp.ram[addr as usize],
         })
     }
 
     fn write8(&mut self, addr: u16, data: u8) {
-        trace!("Write: {addr:#06X} = {data:#04X}");
+        // trace!("Write: {addr:#06X} = {data:#04X}");
         if self.ioregs.ram_write_enable {
-            self.ram[addr as usize] = data;
+            self.dsp.ram[addr as usize] = data;
         }
         if addr & 0xFFF0 == 0x00F0 {
             self.io_write(addr & 0xF, data);
@@ -314,33 +329,28 @@ impl Spc {
     fn io_read(&mut self, addr: u16) -> u8 {
         let data = match addr {
             0 => {
-                trace!("Read TEST");
+                warn!("Read TEST");
                 0
             }
             1 => {
-                trace!("Read CONTROL");
+                warn!("Read CONTROL");
                 0
             }
             2 => self.ioregs.dsp_reg,
-            3 => {
-                debug!("Read DSP reg: #{:#04X}", self.ioregs.dsp_reg);
-                0
+            3 => self.dsp.read(self.ioregs.dsp_reg),
+            4..=7 => {
+                let data = self.ioregs.cpuin[addr as usize - 4];
+                trace!("CPUIO {} -> {data:#04X}", addr as usize - 4);
+                data
             }
-            4..=7 => self.ioregs.cpuin[addr as usize - 4],
-            8..=9 => {
-                debug!("Read External I/O Port P{}", addr - 4);
-                0
-            }
-            0xA..=0xC => {
-                trace!("Read Timer {} Divider", addr - 0xA);
-                0
-            }
+            8..=9 => self.ioregs.ext_io[addr as usize - 8],
+            0xA..=0xC => 0,
             0xD..=0xF => {
                 let data = self.ioregs.timer[addr as usize - 0xD].output;
                 self.ioregs.timer[addr as usize - 0xD].output = 0;
                 data
             }
-            _ => todo!("IO Read: {addr:X}"),
+            _ => unreachable!(),
         };
 
         trace!("IO Read:  {addr:X} = {data:#04X}");
@@ -359,18 +369,19 @@ impl Spc {
 
                 const WS_TBL: [u64; 4] = [0, 1, 4, 9];
 
-                self.ioregs.rom_enable = data & 2 != 0;
+                self.ioregs.ram_write_enable = data & 2 != 0;
                 self.ioregs.crash_spc700 = data & 4 != 0;
                 self.ioregs.ram_wait_cycle = WS_TBL[(data as usize >> 4) & 3] + 1;
                 self.ioregs.io_wait_cycle = WS_TBL[(data as usize >> 6) & 3] + 1;
             }
             1 => {
                 for i in 0..3 {
-                    self.ioregs.timer[i].enable = data & (1 << i) != 0;
-                    if !self.ioregs.timer[i].enable {
+                    let enable = data & (1 << i) != 0;
+                    if !self.ioregs.timer[i].enable && enable {
                         self.ioregs.timer[i].counter = 0;
                         self.ioregs.timer[i].output = 0;
                     }
+                    self.ioregs.timer[i].enable = enable;
                 }
                 for i in 0..2 {
                     if data & (1 << (i + 4)) != 0 {
@@ -381,22 +392,17 @@ impl Spc {
                 self.ioregs.rom_enable = data & 0x80 != 0;
             }
             2 => self.ioregs.dsp_reg = data,
-            3 => {
-                debug!(
-                    "Write DSP reg: #{:#04X} = #{data:#04X}",
-                    self.ioregs.dsp_reg
-                );
-            }
+            3 => self.dsp.write(self.ioregs.dsp_reg, data),
             4..=7 => {
-                debug!("CPUIO{} = {data:#04X}", addr as usize - 4);
+                trace!("CPUIO {} <- {data:#04X}", addr as usize - 4);
                 self.ioregs.cpuout[addr as usize - 4] = data
             }
-            8..=9 => debug!("External I/O Port P{} = {data:#04X}", addr - 4),
+            8..=9 => self.ioregs.ext_io[addr as usize - 8] = data,
             0xA..=0xC => self.ioregs.timer[addr as usize - 0xA].divider = data,
             0xD..=0xF => {
-                warn!("Write Timer {} Divider = {data:#04X}", addr - 0xD);
+                warn!("Write Timer {} Counter = {data:#04X}", addr - 0xD);
             }
-            _ => todo!("IO Write: {addr:X} = {data:#04X}"),
+            _ => unreachable!(),
         }
     }
 }
@@ -780,14 +786,33 @@ impl Spc {
 
             // Special ALU Operations
             (daa (reg a)) => {{
+                let src = self.regs.a;
+                if self.regs.psw.h() || (src & 0x0F) > 9 {
+                    self.regs.a = self.regs.a.wrapping_add(6);
+                    if self.regs.a < 6 {
+                        self.regs.psw.set_c(true);
+                    }
+                }
+                if self.regs.psw.c() || src > 0x99 {
+                    self.regs.a = self.regs.a.wrapping_add(0x60);
+                    self.regs.psw.set_c(true);
+                }
+                self.regs.set_nz(self.regs.a);
                 elapse!(ram, 1);
                 elapse!(io, 1);
-                todo!("DAA")
             }};
             (das (reg a)) => {{
+                let src = self.regs.a;
+                if !self.regs.psw.h() || (src & 0x0F) > 9 {
+                    self.regs.a = self.regs.a.wrapping_sub(6);
+                }
+                if !self.regs.psw.c() || src > 0x99 {
+                    self.regs.a = self.regs.a.wrapping_sub(0x60);
+                    self.regs.psw.set_c(false);
+                }
+                self.regs.set_nz(self.regs.a);
                 elapse!(ram, 1);
                 elapse!(io, 1);
-                todo!("DAS")
             }};
             (xcn (reg a)) => {{
                 let v = self.regs.a.rotate_right(4);
@@ -903,7 +928,7 @@ impl Spc {
             }};
             (tcall $i:expr) => {{
                 self.push16(self.regs.pc);
-                self.regs.pc = 0xFFDE - (2 * $i);
+                self.regs.pc = self.read16(0xFFDE - (2 * $i));
                 elapse!(io, 3);
             }};
             (pcall imm) => {{
@@ -937,10 +962,10 @@ impl Spc {
                 elapse!(ram, 1)
             };
             (sleep) => {
-                todo!("sleep")
+                panic!("sleep")
             };
             (stop) => {
-                todo!("stop")
+                panic!("stop")
             };
             (clr p) => {{
                 self.regs.psw.set_p(false);
@@ -1070,37 +1095,36 @@ impl Spc {
         }
 
         macro_rules! rmw_op {
-            (asl, $op:expr) => {{
-                let (v, c) = $op.overflowing_shl(1);
+            (asl, $op:ident) => {{
+                let v = $op << 1;
                 self.regs.set_nz(v);
-                self.regs.psw.set_c(c);
+                self.regs.psw.set_c($op & 0x80 != 0);
                 v
             }};
-            (rol, $op:expr) => {{
-                let (v, c) = $op.overflowing_shl(1);
-                let v = v | self.regs.psw.c() as u8;
+            (rol, $op:ident) => {{
+                let v = $op << 1 | self.regs.psw.c() as u8;
                 self.regs.set_nz(v);
-                self.regs.psw.set_c(c);
+                self.regs.psw.set_c($op & 0x80 != 0);
                 v
             }};
-            (lsr, $op:expr) => {{
+            (lsr, $op:ident) => {{
                 let v = $op >> 1;
                 self.regs.set_nz(v);
                 self.regs.psw.set_c($op & 1 != 0);
                 v
             }};
-            (ror, $op:expr) => {{
+            (ror, $op:ident) => {{
                 let v = ($op >> 1) | ((self.regs.psw.c() as u8) << 7);
                 self.regs.set_nz(v);
                 self.regs.psw.set_c($op & 1 != 0);
                 v
             }};
-            (inc, $op:expr) => {{
+            (inc, $op:ident) => {{
                 let v = $op.wrapping_add(1);
                 self.regs.set_nz(v);
                 v
             }};
-            (dec, $op:expr) => {{
+            (dec, $op:ident) => {{
                 let v = $op.wrapping_sub(1);
                 self.regs.set_nz(v);
                 v
@@ -1388,9 +1412,9 @@ impl SpcFile {
                 pc: self.pc,
             },
             ioregs: IORegisters::default(),
-            ram: self.ram.clone(),
+            dsp: Dsp::default(),
             counter: 0,
-            audio_buffer: AudioBuffer::default(),
+            dsp_counter: 0,
         };
 
         for i in 0x00F1..=0x00FC {

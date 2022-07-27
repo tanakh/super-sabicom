@@ -3,12 +3,17 @@ use modular_bitfield::prelude::*;
 
 use crate::context;
 
+const CYCLES_SLOW: u64 = 8;
+const CYCLES_FAST: u64 = 6;
+const CYCLES_JOY: u64 = 12;
+
 pub trait Context:
-    context::Ppu + context::Spc + context::Rom + context::Interrupt + context::Timing
+    context::Ppu + context::Spc + context::Cartridge + context::Interrupt + context::Timing
 {
 }
-impl<T: context::Ppu + context::Spc + context::Rom + context::Interrupt + context::Timing> Context
-    for T
+impl<
+        T: context::Ppu + context::Spc + context::Cartridge + context::Interrupt + context::Timing,
+    > Context for T
 {
 }
 
@@ -28,7 +33,7 @@ pub struct Bus {
     dma: [Dma; 8],
 
     locked: bool,
-    pad_data: [u16; 4],
+    controller_port: [ControllerPort; 2],
 
     wram: Vec<u8>,
     wram_addr: u32,
@@ -154,40 +159,51 @@ impl Default for Bus {
             hdma_enable: 0,
             dma: Default::default(),
             locked: false,
-            pad_data: Default::default(),
+            controller_port: Default::default(),
             wram: vec![0; 0x20000], // 128KB
             wram_addr: 0,
         }
     }
 }
 
-const CYCLES_SLOW: u64 = 8;
-const CYCLES_FAST: u64 = 6;
-const CYCLES_JOY: u64 = 12;
+#[derive(Default)]
+struct ControllerPort {
+    enable: bool,
+    pad_data: [u16; 2],
+    clk: bool,
+    pos: usize,
+}
 
 impl Bus {
     pub fn set_input(&mut self, input: &meru_interface::InputData) {
-        // TODO
+        for i in 0..4 {
+            if i >= input.controllers.len() {
+                self.controller_port[i % 2].pad_data[i / 2] = 0;
+                continue;
+            }
 
-        //   Register    Serial     Default
-        //   Bit         Transfer   Purpose
-        //   Number______Order______(Joypads)_____
-        //   15          1st        Button B          (1=Low=Pressed)
-        //   14          2nd        Button Y
-        //   13          3rd        Select Button
-        //   12          4th        Start Button
-        //   11          5th        DPAD Up
-        //   10          6th        DPAD Down
-        //   9           7th        DPAD Left
-        //   8           8th        DPAD Right
-        //   7           9th        Button A
-        //   6           10th       Button X
-        //   5           11th       Button L
-        //   4           12th       Button R
-        //   3           13th       0 (High)
-        //   2           14th       0 (High)
-        //   1           15th       0 (High)
-        //   0           16th       0 (High)
+            let mut data = 0;
+
+            for (name, value) in &input.controllers[i] {
+                match name.as_str() {
+                    "B" => data |= (*value as u16) << 15,
+                    "Y" => data |= (*value as u16) << 14,
+                    "Select" => data |= (*value as u16) << 13,
+                    "Start" => data |= (*value as u16) << 12,
+                    "Up" => data |= (*value as u16) << 11,
+                    "Down" => data |= (*value as u16) << 10,
+                    "Left" => data |= (*value as u16) << 9,
+                    "Right" => data |= (*value as u16) << 8,
+                    "A" => data |= (*value as u16) << 7,
+                    "X" => data |= (*value as u16) << 6,
+                    "L" => data |= (*value as u16) << 5,
+                    "R" => data |= (*value as u16) << 4,
+                    _ => unreachable!(),
+                }
+            }
+
+            self.controller_port[i % 2].pad_data[i / 2] = data;
+        }
     }
 
     pub fn locked(&self) -> bool {
@@ -228,7 +244,8 @@ impl Bus {
                     self.io_read(ctx, offset)
                 }
                 0x6000..=0x7FFF => {
-                    panic!("Read expantion region: {bank:02X}:{offset:04X}")
+                    ctx.elapse(CYCLES_SLOW);
+                    ctx.cartridge().read(addr)
                 }
                 0x8000..=0xFFFF => {
                     ctx.elapse(if bank & 0x80 == 0 {
@@ -236,12 +253,12 @@ impl Bus {
                     } else {
                         self.ws2_access_cycle
                     });
-                    ctx.rom().read(addr)
+                    ctx.cartridge().read(addr)
                 }
             },
             0x40..=0x7D => {
                 ctx.elapse(CYCLES_SLOW);
-                ctx.rom().read(addr)
+                ctx.cartridge().read(addr)
             }
             0x7E..=0x7F => {
                 ctx.elapse(CYCLES_SLOW);
@@ -249,7 +266,7 @@ impl Bus {
             }
             0xC0..=0xFF => {
                 ctx.elapse(self.ws2_access_cycle);
-                ctx.rom().read(addr)
+                ctx.cartridge().read(addr)
             }
             _ => unreachable!(),
         };
@@ -264,12 +281,12 @@ impl Bus {
         Some(match bank {
             0x00..=0x3F | 0x80..=0xBF => match offset {
                 0x0000..=0x1FFF => self.wram[offset as usize],
-                0x8000..=0xFFFF => ctx.rom().read(addr),
+                0x6000..=0xFFFF => ctx.cartridge().read(addr),
                 _ => None?,
             },
-            0x40..=0x7D => ctx.rom().read(addr),
+            0x40..=0x7D => ctx.cartridge().read(addr),
             0x7E..=0x7F => self.wram[(addr & 0x1FFFF) as usize],
-            0xC0..=0xFF => ctx.rom().read(addr),
+            0xC0..=0xFF => ctx.cartridge().read(addr),
             _ => unreachable!(),
         })
     }
@@ -305,7 +322,8 @@ impl Bus {
                     self.io_write(ctx, offset, data);
                 }
                 0x6000..=0x7FFF => {
-                    panic!("Write expantion region: {bank:02X}:{offset:04X}")
+                    ctx.elapse(CYCLES_SLOW);
+                    ctx.cartridge_mut().write(addr, data);
                 }
                 0x8000..=0xFFFF => {
                     ctx.elapse(if bank & 0x80 == 0 {
@@ -313,12 +331,12 @@ impl Bus {
                     } else {
                         self.ws2_access_cycle
                     });
-                    ctx.rom_mut().write(addr, data);
+                    ctx.cartridge_mut().write(addr, data);
                 }
             },
             0x40..=0x7D => {
                 ctx.elapse(CYCLES_SLOW);
-                ctx.rom_mut().write(addr, data)
+                ctx.cartridge_mut().write(addr, data)
             }
             0x7E..=0x7F => {
                 ctx.elapse(CYCLES_SLOW);
@@ -326,7 +344,7 @@ impl Bus {
             }
             0xC0..=0xFF => {
                 ctx.elapse(self.ws2_access_cycle);
-                ctx.rom_mut().write(addr, data);
+                ctx.cartridge_mut().write(addr, data);
             }
             _ => unreachable!(),
         }
@@ -337,16 +355,30 @@ impl Bus {
             0x2100..=0x213F => ctx.ppu_read(addr),
             0x2140..=0x217F => ctx.spc().read_port((addr & 3) as _),
 
+            // WMDATA  - WRAM Data Read/Write
+            0x2180 => {
+                let ret = self.wram[self.wram_addr as usize];
+                self.wram_addr = (self.wram_addr + 1) & 0x1FFFF;
+                ret
+            }
+
             // CPU On-Chip I/O Ports
             // JOYA - Joypad Input Register A (R)
             0x4016 => {
-                // FIXME: Manual read from joy pad and strobe
-                0
+                let b0 = self.controller_read(0, 4);
+                let b1 = self.controller_read(0, 5);
+                self.controller_write(0, 2, true);
+                self.controller_write(0, 2, false);
+                b0 as u8 | (b1 as u8) << 1
             }
             // JOYB - Joypad Input Register B (R)
             0x4017 => {
                 // FIXME: Manual read from joy pad and strobe
-                0
+                let b0 = self.controller_read(1, 4);
+                let b1 = self.controller_read(1, 5);
+                self.controller_write(1, 2, true);
+                self.controller_write(1, 2, false);
+                b0 as u8 | (b1 as u8) << 1 | 0x1C
             }
 
             // CPU On-Chip I/O Ports (Write-only) (Read=open bus)
@@ -376,7 +408,12 @@ impl Bus {
                 ret
             }
 
-            // 0x4213 - RDIO    - Joypad Programmable I/O Port (Input)
+            // RDIO    - Joypad Programmable I/O Port (Input)
+            0x4213 => {
+                let b6 = self.controller_read(0, 6);
+                let b7 = self.controller_read(1, 6);
+                (b6 as u8) << 6 | (b7 as u8) << 7
+            }
 
             // RDDIVL/H - Unsigned Division Result (Quotient)
             0x4214 => self.div_quot as u8,
@@ -388,8 +425,11 @@ impl Bus {
             0x4218..=0x421F => {
                 let i = (addr - 0x4218) as usize / 2;
                 let h = (addr - 0x4218) as usize % 2;
-                (self.pad_data[i] >> (8 * h)) as u8
+                (self.controller_port[i % 2].pad_data[i / 2] >> (8 * h)) as u8
             }
+
+            // CPU DMA, For below ports, x = Channel number 0..7 (R/W)
+            0x4300..=0x437F => self.dma_read(((addr >> 4) & 0x7) as _, (addr & 0xF) as _),
 
             _ => todo!(
                 "IO Read: {addr:#06X}{}",
@@ -422,9 +462,14 @@ impl Bus {
             0x2182 => self.wram_addr = (self.wram_addr & 0x100FF) | ((data as u32) << 8),
             0x2183 => self.wram_addr = (self.wram_addr & 0x0FFFF) | ((data as u32 & 1) << 16),
 
+            0x2184..=0x21FF => error!("Write to Unused region: {addr:#06X} = {data:#04X}"),
+
             // CPU On-Chip I/O Ports
             0x4016 => {
-                info!("JOYWR = {data:#04X}");
+                if data & 1 != 0 {
+                    self.controller_write(0, 3, true);
+                    self.controller_write(1, 3, true);
+                }
             }
 
             // CPU On-Chip I/O Ports (Write-only) (Read=open bus)
@@ -435,7 +480,8 @@ impl Bus {
                 interrupt.set_hvirq_enable(self.interrupt_enable.hvirq_enable());
             }
             0x4201 => {
-                info!("WRIO = {data:#04X}");
+                self.controller_port[0].enable = data & (1 << 6) != 0;
+                self.controller_port[1].enable = data & (1 << 7) != 0;
             }
             0x4202 => self.mul_a = data,
             0x4203 => {
@@ -487,7 +533,26 @@ impl Bus {
 
             // CPU DMA, For below ports, x = Channel number 0..7 (R/W)
             0x4300..=0x437F => self.dma_write(((addr >> 4) & 0x7) as _, (addr & 0xF) as _, data),
+
             _ => error!("IO Write: {addr:#06X} = {data:#04X}"),
+        }
+    }
+
+    fn dma_read(&mut self, ch: usize, cmd: u8) -> u8 {
+        match cmd {
+            0 => self.dma[ch].param.bytes[0],
+            1 => self.dma[ch].iobus_addr,
+            2 => self.dma[ch].cur_addr as u8,
+            3 => (self.dma[ch].cur_addr >> 8) as u8,
+            4 => self.dma[ch].cur_bank,
+            5 => self.dma[ch].byte_count_or_indirect_hdma_addr as u8,
+            6 => (self.dma[ch].byte_count_or_indirect_hdma_addr >> 8) as u8,
+            7 => self.dma[ch].indirect_hdma_bank,
+            8 => self.dma[ch].hdma_cur_addr as u8,
+            9 => (self.dma[ch].hdma_cur_addr >> 8) as u8,
+            0xA => self.dma[ch].hdma_line_counter,
+            0xB | 0xF => self.dma[ch].unused,
+            _ => panic!("Invalid DMA register read: {cmd:0X}"),
         }
     }
 
@@ -521,7 +586,7 @@ impl Bus {
             0xA => self.dma[ch].hdma_line_counter = data,
             0xB | 0xF => self.dma[ch].unused = data,
 
-            _ => panic!("Invalid DMA write: {cmd:0X} = {data:#04X}"),
+            _ => panic!("Invalid DMA register write: {cmd:0X} = {data:#04X}"),
         }
     }
 
@@ -566,22 +631,28 @@ impl Bus {
             self.dma[ch].byte_count_or_indirect_hdma_addr,
         );
 
-        if matches!(self.dma[ch].param.transfer_dir(), DmaTransferDir::IoToCpu) {
-            todo!("IO to CPU DMA");
-        }
-
         let a_inc = match self.dma[ch].param.abus_addr_step() {
             DmaAddrStep::Increment => 1,
             DmaAddrStep::Decrement => (-1_i16) as u16,
             DmaAddrStep::Fixed | DmaAddrStep::Fixed2 => 0,
         };
 
-        for i in 0..transfer_unit.len() {
-            let src_addr = (self.dma[ch].cur_bank as u32) << 16 | a_addr as u32;
-            let dst_addr = 0x2100 | b_addr.wrapping_add(transfer_unit[i] as u8) as u32;
+        let transfer_dir = self.dma[ch].param.transfer_dir();
 
-            let data = self.read(ctx, src_addr);
-            self.write(ctx, dst_addr, data);
+        for i in 0..transfer_unit.len() {
+            let cpu_addr = (self.dma[ch].cur_bank as u32) << 16 | a_addr as u32;
+            let io_addr = 0x2100 | b_addr.wrapping_add(transfer_unit[i] as u8) as u32;
+
+            match transfer_dir {
+                DmaTransferDir::CpuToIo => {
+                    let data = self.read(ctx, cpu_addr);
+                    self.write(ctx, io_addr, data);
+                }
+                DmaTransferDir::IoToCpu => {
+                    let data = self.read(ctx, io_addr);
+                    self.write(ctx, cpu_addr, data);
+                }
+            }
 
             a_addr = a_addr.wrapping_add(a_inc);
             self.locked = true;
@@ -694,6 +765,48 @@ impl Bus {
             } else {
                 self.dma[ch].hdma_do_transfer = true;
             }
+        }
+    }
+
+    fn controller_read(&mut self, port: usize, pin: usize) -> bool {
+        if !self.controller_port[port].enable {
+            return false;
+        }
+
+        match pin {
+            4 => {
+                self.controller_port[port].pad_data[0] & (1 << self.controller_port[port].pos) != 0
+            }
+            5 => {
+                self.controller_port[port].pad_data[1] & (1 << self.controller_port[port].pos) != 0
+            }
+            6 => {
+                // FIXME
+                warn!("Read controller port {port}, pin {pin}");
+                true
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    fn controller_write(&mut self, port: usize, pin: usize, data: bool) {
+        match pin {
+            2 => {
+                let prev = self.controller_port[port].clk;
+                self.controller_port[port].clk = data;
+                if !prev && data {
+                    self.controller_port[port].pos += 1;
+                }
+            }
+            3 => {
+                self.controller_port[port].pos = 0;
+                self.controller_port[port].clk = false;
+            }
+            6 => {
+                // FIXME
+                warn!("Write controller port {port}, pin {pin} = {data}");
+            }
+            _ => unreachable!(),
         }
     }
 }

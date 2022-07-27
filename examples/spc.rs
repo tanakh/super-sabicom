@@ -1,9 +1,6 @@
 use std::path::PathBuf;
 
-use super_sabicom::{
-    context,
-    spc::{Spc, SpcFile},
-};
+use super_sabicom::{context, spc::SpcFile};
 
 #[derive(Default)]
 struct Timing {

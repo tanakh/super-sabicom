@@ -1,6 +1,6 @@
 use super_sabicom_macro::{context, delegate};
 
-use crate::{bus, cpu, ppu, rom, spc};
+use crate::{bus, cartridge, cpu, ppu, rom, spc};
 
 pub trait Cpu {
     fn reset(&mut self);
@@ -37,9 +37,9 @@ pub trait Spc {
 }
 
 #[delegate]
-pub trait Rom {
-    fn rom(&self) -> &rom::Rom;
-    fn rom_mut(&mut self) -> &mut rom::Rom;
+pub trait Cartridge {
+    fn cartridge(&self) -> &cartridge::Cartridge;
+    fn cartridge_mut(&mut self) -> &mut cartridge::Cartridge;
 }
 
 #[delegate]
@@ -61,10 +61,10 @@ pub struct Context {
     #[split(Inner1: Bus)]
     bus: bus::Bus,
 
-    #[split(Inner2: Ppu + Spc + Rom)]
+    #[split(Inner2: Ppu + Spc + Cartridge)]
     ppu: ppu::Ppu,
     spc: spc::Spc,
-    rom: rom::Rom,
+    cartridge: cartridge::Cartridge,
 
     #[split(Inner3: Interrupt + Timing)]
     interrupt: InterruptCtrl,
@@ -153,8 +153,9 @@ impl Context {
         let bus = bus::Bus::default();
         let ppu = ppu::Ppu::default();
         let spc = spc::Spc::default();
+        let cartridge = cartridge::Cartridge::new(rom);
 
-        let mut ret = Self::new(cpu, bus, ppu, spc, rom, Default::default(), 0);
+        let mut ret = Self::new(cpu, bus, ppu, spc, cartridge, Default::default(), 0);
         ret.reset();
 
         ret
@@ -230,12 +231,12 @@ impl Spc for Inner2 {
     }
 }
 
-impl Rom for Inner2 {
-    fn rom(&self) -> &rom::Rom {
-        &self.rom
+impl Cartridge for Inner2 {
+    fn cartridge(&self) -> &cartridge::Cartridge {
+        &self.cartridge
     }
-    fn rom_mut(&mut self) -> &mut rom::Rom {
-        &mut self.rom
+    fn cartridge_mut(&mut self) -> &mut cartridge::Cartridge {
+        &mut self.cartridge
     }
 }
 
