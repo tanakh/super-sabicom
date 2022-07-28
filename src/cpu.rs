@@ -427,10 +427,10 @@ impl Cpu {
             // set B (X) flag on BRK or COP
             p.set_x(matches!(e, Exception::Brk | Exception::Cop));
         }
-        self.push16(ctx, self.regs.pc);
         if !self.regs.e {
             self.push8(ctx, self.regs.pb);
         }
+        self.push16(ctx, self.regs.pc);
         self.push8(ctx, p.into());
 
         self.regs.p.set_d(false);
@@ -724,8 +724,10 @@ impl Cpu {
                 // FIXME: RTI cannot modify the B-Flag or the unused flag.
                 let p = self.pop8(ctx);
                 self.regs.set_p(p);
-                self.regs.pb = self.pop8(ctx);
                 self.regs.pc = self.pop16(ctx);
+                if !self.regs.e {
+                    self.regs.pb = self.pop8(ctx);
+                }
             }};
             (rtl) => {{
                 self.regs.pc = self.pop16(ctx).wrapping_add(1);
@@ -763,12 +765,14 @@ impl Cpu {
             };
 
             // misc
-            (brk) => {
+            (brk) => {{
+                self.regs.pc = self.regs.pc.wrapping_add(1);
                 self.exception(ctx, Exception::Brk)
-            };
-            (cop) => {
+            }};
+            (cop) => {{
+                self.regs.pc = self.regs.pc.wrapping_add(1);
                 self.exception(ctx, Exception::Cop)
-            };
+            }};
 
             // flags
             (clc) => {
