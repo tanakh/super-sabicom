@@ -28,18 +28,35 @@ impl Cartridge {
             MapMode::LoRom => {
                 let bank = addr >> 16;
 
-                if self.rom.rom.len() > 0x40 * 0x8000 {
-                    // The older boards map SRAM to the whole 64K areas at banks 70h-7Dh/F0-FFh.
-                    // The newer boards map SRAM to the lower 32K areas at banks 70h-7Dh/F0-FFh (this allows "BigLoROM" games to use the upper 32K of that banks as additional LoROM banks, which is required for games with more than 3MB LoROM).
-                    todo!("Support LoROM larger than 2MB");
+                if self.rom.rom.len() > 4 << 20 {
+                    todo!("Support LoROM larger than 4MB");
                 }
 
-                if !self.rom.chipset.has_ram || bank & 0x7F < 0x70 {
-                    let rom_addr = (bank & 0x3F) << 15 | addr & 0x7FFF;
-                    self.rom.rom[rom_addr as usize]
-                } else {
-                    let sram_addr = (bank & 0xF) << 15 | addr & 0x7FFF;
-                    self.sram[sram_addr as usize]
+                match bank as u8 {
+                    0x00..=0x3F | 0x80..=0xBF => {
+                        if addr & 0x8000 != 0 {
+                            let rom_addr = (bank & 0x3F) << 15 | addr & 0x7FFF;
+                            self.rom.rom[rom_addr as usize]
+                        } else {
+                            panic!("Unmapped LoROM area: {addr:06X}")
+                        }
+                    }
+                    0x40..=0x6F | 0xC0..=0xEF => {
+                        // FIXME:
+                        // May be mapped as the higher bank ($8000 - $FFFF) if chip is not MAD-1. Otherwise this area is unused
+                        let rom_addr = (bank & 0x7F) << 15 | addr & 0x7FFF;
+                        self.rom.rom[rom_addr as usize]
+                    }
+                    0x70..=0x7D | 0xF0..=0xFF => {
+                        if addr & 0x8000 == 0 {
+                            let sram_addr = (bank & 0xF) << 15 | addr & 0x7FFF;
+                            self.sram[(sram_addr as usize) % self.sram.len()]
+                        } else {
+                            let rom_addr = (bank & 0x7F) << 15 | addr & 0x7FFF;
+                            self.rom.rom[rom_addr as usize]
+                        }
+                    }
+                    0x7E..=0x7F => unreachable!(),
                 }
             }
             MapMode::HiRom => {
@@ -65,11 +82,17 @@ impl Cartridge {
             MapMode::LoRom => {
                 let bank = addr >> 16;
 
-                if !self.rom.chipset.has_ram && bank & 0x7F < 0x70 {
-                    panic!("Write to SRAM with no SRAM cartridge");
-                } else {
-                    let sram_addr = (bank & 0xF) << 15 | addr & 0x7FFF;
-                    self.sram[sram_addr as usize] = data;
+                match bank as u8 {
+                    0x70..=0x7D | 0xF0..=0xFF => {
+                        if addr & 0x8000 == 0 {
+                            let sram_addr = (bank & 0xF) << 15 | addr & 0x7FFF;
+                            let sram_len = self.sram.len();
+                            self.sram[(sram_addr as usize) % sram_len] = data;
+                        }
+                    }
+                    _ => {
+                        log::warn!("Write to unmapped LoROM area: {addr:06X} = {data:02X}");
+                    }
                 }
             }
             MapMode::HiRom => {
