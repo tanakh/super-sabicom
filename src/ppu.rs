@@ -650,13 +650,11 @@ impl Ppu {
                 ret
             }
 
-            0x2115 | 0x2120 | 0x2121 => {
+            _ => {
                 // FIXME: Open-bus
-                warn!("PPU Read: {addr:04X}");
+                warn!("PPU Read (open-bus): {addr:04X}");
                 0
             }
-
-            _ => todo!("PPU Read: {addr:04X}"),
         }
     }
 
@@ -746,7 +744,7 @@ impl Ppu {
             0x211C => {
                 self.rot_param.b = (data as u16) << 8 | self.m7_old as u16;
                 self.m7_old = data;
-                self.mul_result = self.rot_param.a as i16 as i32 * self.rot_param.b as i8 as i32;
+                self.mul_result = self.rot_param.a as i16 as i32 * data as i8 as i32;
             }
             0x211D => {
                 self.rot_param.c = (data as u16) << 8 | self.m7_old as u16;
@@ -1016,7 +1014,10 @@ impl Ppu {
                 }
             }
             2 => todo!("BG Mode 2"),
-            3 => todo!("BG Mode 3"),
+            3 => {
+                self.render_bg(y, 0, 8, 8, 2, 0x00);
+                self.render_bg(y, 1, 4, 11, 5, 0x00);
+            }
             4 => todo!("BG Mode 4"),
             5 => todo!("BG Mode 5"),
             6 => todo!("BG Mode 6"),
@@ -1119,8 +1120,7 @@ impl Ppu {
 
             let z = if entry.priority() == 0 { zl } else { zh } * 0x10 + pixel_kind;
 
-            let char_num =
-                entry.char_num() as usize + pixel_x / 8 + (((pixel_y / 8) * 0x10) & 0x3FF);
+            let char_num = (entry.char_num() as usize + pixel_x / 8 + pixel_y / 8 * 0x10) & 0x3FF;
             let pixel_x = pixel_x % 8;
             let pixel_y = pixel_y % 8;
 
