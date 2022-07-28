@@ -506,8 +506,20 @@ impl Cpu {
 
         macro_rules! exec_instr {
             (mov s, $src:ident) => {
-                self.regs.s = reg!($src)
+                if !self.regs.e {
+                    self.regs.s = reg!($src)
+                } else {
+                    self.regs.s = self.regs.s & 0xFF00 | reg!($src) & 0xFF;
+                }
             };
+            (mov a, d) => {{
+                self.regs.a = self.regs.d;
+                self.regs.set_nz(self.regs.a);
+            }};
+            (mov a, s) => {{
+                self.regs.a = self.regs.s;
+                self.regs.set_nz(self.regs.a);
+            }};
             (mov $dst:ident, $src:ident) => {
                 if is_8bit!(self, $dst) {
                     let v = reg!($src) as u8;
