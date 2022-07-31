@@ -63,7 +63,7 @@ impl Default for Registers {
             a: 0,
             x: 0,
             y: 0,
-            sp: 0,
+            sp: 0xFF,
             psw: Flags::default(),
             pc: u16::from_le_bytes(BOOT_ROM[0xFFFE - 0xFFC0..].try_into().unwrap()),
         }
