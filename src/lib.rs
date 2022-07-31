@@ -64,6 +64,7 @@ impl EmulatorCore for Snes {
         );
         vec![
             ("Title".into(), String::from_utf8_lossy(&rom.title).into()),
+            ("Game Code".into(), game_code),
             ("Speed".into(), format!("{:?}", rom.speed)),
             ("Map Mode".into(), format!("{:?}", rom.map_mode)),
             ("Chipset".into(), format!("{}", rom.chipset)),
@@ -72,7 +73,6 @@ impl EmulatorCore for Snes {
             ("SRAM Size".into(), format!("{}", rom.sram_size)),
             ("Country".into(), format!("{}", rom.country)),
             ("Developer ID".into(), format!("{}", rom.developer_id)),
-            ("Game Code".into(), game_code),
             ("Rom Version".into(), format!("{}", rom.rom_version)),
         ]
     }
