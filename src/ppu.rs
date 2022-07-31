@@ -508,7 +508,7 @@ impl Ppu {
 
             if render && self.x == 22 {
                 if (1..1 + SCREEN_HEIGHT).contains(&self.y) {
-                    self.render_line(self.y - 1);
+                    self.render_line(self.y);
                     self.copy_line_buffer(self.y - 1);
                 }
             }
@@ -573,12 +573,13 @@ impl Ppu {
             // 0x2139 - RDVRAML - "PPU1 VRAM Data Read           (lower 8bits)"
             // 0x213A - RDVRAMH - "PPU1 VRAM Data Read           (upper 8bits)"
             0x2139 | 0x213A => {
-                let ofs = (addr - 0x2139) as usize;
-                let ret = self.vram_prefetch[ofs];
+                let ofs = addr - 0x2139;
+                let ret = self.vram_prefetch[ofs as usize];
                 if self.vram_addr_inc_mode.inc_after_high_byte() == (ofs == 1) {
                     // Prefetch BEFORE incrementing vram address
-                    self.vram_prefetch[0] = self.vram[(self.vram_addr * 2) as usize + ofs];
-                    self.vram_prefetch[1] = self.vram[(self.vram_addr * 2 + 1) as usize + ofs];
+                    let vram_addr = self.vram_addr_inc_mode.translate(self.vram_addr) * 2;
+                    self.vram_prefetch[0] = self.vram[vram_addr as usize];
+                    self.vram_prefetch[1] = self.vram[(vram_addr + 1) as usize];
                     self.vram_addr =
                         (self.vram_addr + self.vram_addr_inc_mode.inc_words()) & 0x7FFF;
                 }
@@ -732,8 +733,8 @@ impl Ppu {
             }
             0x2118 | 0x2119 => {
                 let ofs = addr - 0x2118;
-                let vram_addr = self.vram_addr_inc_mode.translate(self.vram_addr);
-                self.vram[(vram_addr * 2 + ofs) as usize] = data;
+                let vram_addr = self.vram_addr_inc_mode.translate(self.vram_addr) * 2 + ofs;
+                self.vram[vram_addr as usize] = data;
                 if self.vram_addr_inc_mode.inc_after_high_byte() == (ofs == 1) {
                     self.vram_addr =
                         (self.vram_addr + self.vram_addr_inc_mode.inc_words()) & 0x7FFF;
@@ -1134,7 +1135,7 @@ impl Ppu {
 
             let mut pixel = 0;
             for i in 0..bpp / 2 {
-                let addr = tile_addr + i * 16 + pixel_y * 2;
+                let addr = (tile_addr + i * 16 + pixel_y * 2) & 0xFFFE;
                 let b0 = self.vram[addr];
                 let b1 = self.vram[addr + 1];
                 pixel |= ((b0 >> (7 - pixel_x)) & 1) << (i * 2);
@@ -1286,18 +1287,20 @@ impl Ppu {
         let mut render_obj = 0;
         let mut render_block = 0;
 
-        for i in 0..128 {
-            let i = if !self.oam_addr.priority_rotation() {
-                i
-            } else {
-                127 - i
-            };
+        let priority_rot = if self.oam_addr.priority_rotation() {
+            (self.oam_addr.addr() >> 1) & 0x7F
+        } else {
+            0
+        };
+
+        for i in 0..0x80 {
+            let i = ((i + priority_rot) & 0x7F) as usize;
 
             let entry = ObjEntry::from_bytes(self.oam[i * 4..i * 4 + 4].try_into().unwrap());
             let extra = (self.oam[0x200 + i / 4] >> ((i & 3) * 2)) & 3;
 
             let (ow, oh) = sizes[(extra >> 1) as usize];
-            let oy = entry.y() as usize;
+            let oy = entry.y() as usize + 1;
             if !(oy..oy + oh).contains(&y) {
                 continue;
             }
