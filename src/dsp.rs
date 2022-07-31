@@ -16,6 +16,9 @@ pub struct Dsp {
     na: u8,
 
     voice: [Voice; 8],
+    #[educe(Default = 1)]
+    noise: i16,
+    noise_counter: u16,
 
     #[educe(Default(expression = "vec![0; 0x10000]"))]
     pub ram: Vec<u8>,
@@ -100,8 +103,13 @@ struct AdsrSetting {
     sustain_level: B3, // Boundary=(N+1)*100h
 }
 
+const RATE_TABLE: [u16; 32] = [
+    0, 2048, 1536, 1280, 1024, 768, 640, 512, 384, 320, 256, 192, 160, 128, 96, 80, 64, 48, 40, 32,
+    24, 20, 16, 12, 10, 8, 6, 5, 4, 3, 2, 1,
+];
+
 impl Voice {
-    fn tick(&mut self, ram: &[u8], sample_table_addr: u8, prev_out: Option<i16>, ch: usize) {
+    fn tick(&mut self, ram: &[u8], sample_table_addr: u8, prev_out: Option<i16>, noise: i16) {
         if self.key_on {
             self.key_on = false;
 
@@ -144,17 +152,17 @@ impl Voice {
 
         self.brr_pitch_counter = counter;
 
-        let interpol_ix = ((counter >> 4) & 0xFF) as usize;
-        let sample = self.gaussian_interpolation(interpol_ix);
+        // BRR decode and check end flag are performed even if noise is enabled
+        let sample = if !self.enable_noise {
+            let interpol_ix = ((counter >> 4) & 0xFF) as usize;
+            self.gaussian_interpolation(interpol_ix)
+        } else {
+            noise
+        };
 
         // Calculate envelope
 
         self.cur_envelope &= 0x7FF;
-
-        const RATE_TABLE: [u16; 32] = [
-            0, 2048, 1536, 1280, 1024, 768, 640, 512, 384, 320, 256, 192, 160, 128, 96, 80, 64, 48,
-            40, 32, 24, 20, 16, 12, 10, 8, 6, 5, 4, 3, 2, 1,
-        ];
 
         if !matches!(self.state, EnvelopeState::Release) && !self.adsr_setting.use_adsr() {
             if self.gain_setting & 0x80 == 0 {
@@ -343,13 +351,15 @@ impl Voice {
 
 impl Dsp {
     pub fn tick(&mut self) {
+        self.tick_noise();
+
         for ch in 0..8 {
             let prev_out = if ch == 0 {
                 None
             } else {
                 Some(self.voice[ch - 1].cur_sample)
             };
-            self.voice[ch].tick(&self.ram, self.sample_table_addr, prev_out, ch);
+            self.voice[ch].tick(&self.ram, self.sample_table_addr, prev_out, self.noise);
         }
 
         let mut output = [0; 2];
@@ -383,6 +393,21 @@ impl Dsp {
         };
 
         self.audio_buffer.samples.push(output);
+    }
+
+    fn tick_noise(&mut self) {
+        let rate = self.flags.noise_freq();
+        if rate == 0 {
+            self.noise_counter = 0;
+            return;
+        }
+
+        self.noise_counter += 1;
+        if self.noise_counter >= RATE_TABLE[rate as usize] {
+            self.noise_counter = 0;
+            let b = (self.noise ^ (self.noise >> 1)) & 1;
+            self.noise = ((self.noise & 0x7FFF) | (b << 15)) >> 1;
+        }
     }
 
     pub fn read(&mut self, addr: u8) -> u8 {
@@ -495,7 +520,18 @@ impl Dsp {
                 }
             }
             //   6Ch - FLG      - Reset, Mute, Echo-Write flags and Noise Clock (R/W)
-            0x6C => self.flags.bytes[0] = data,
+            0x6C => {
+                self.flags.bytes[0] = data;
+                if self.flags.reset() {
+                    for ch in 0..8 {
+                        self.voice[ch].key_off = true;
+                        self.voice[ch].cur_envelope = 0;
+                    }
+
+                    // FIXME: This bit is cleared when read?
+                    self.flags.set_reset(false);
+                }
+            }
             //   7Ch - ENDX     - Voice End Flags for Voice 0..7 (R) (W=Ack)
             0x7C => {
                 for ch in 0..8 {
