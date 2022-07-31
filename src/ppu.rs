@@ -513,6 +513,12 @@ impl Ppu {
                 }
             }
 
+            // FIXME: 133.5
+            if self.x == 134 {
+                // DRAM refresh
+                ctx.elapse(40);
+            }
+
             if self.x == 274 {
                 self.hblank = true;
             }
