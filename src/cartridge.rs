@@ -49,11 +49,21 @@ impl Cartridge {
                     }
                     0x70..=0x7D | 0xF0..=0xFF => {
                         if addr & 0x8000 == 0 {
-                            let sram_addr = (bank & 0xF) << 15 | addr & 0x7FFF;
-                            self.sram[(sram_addr as usize) % self.sram.len()]
+                            let sram_addr = ((bank & 0xF) << 15 | addr & 0x7FFF) as usize;
+                            if sram_addr < self.sram.len() {
+                                self.sram[sram_addr]
+                            } else {
+                                // FIXME: Open-bus?
+                                0
+                            }
                         } else {
-                            let rom_addr = (bank & 0x7F) << 15 | addr & 0x7FFF;
-                            self.rom.rom[rom_addr as usize]
+                            let rom_addr = ((bank & 0x7F) << 15 | addr & 0x7FFF) as usize;
+                            if rom_addr < self.rom.rom.len() {
+                                self.rom.rom[rom_addr as usize]
+                            } else {
+                                // FIXME: Open-bus?
+                                0
+                            }
                         }
                     }
                     0x7E..=0x7F => unreachable!(),
@@ -85,9 +95,10 @@ impl Cartridge {
                 match bank as u8 {
                     0x70..=0x7D | 0xF0..=0xFF => {
                         if addr & 0x8000 == 0 {
-                            let sram_addr = (bank & 0xF) << 15 | addr & 0x7FFF;
-                            let sram_len = self.sram.len();
-                            self.sram[(sram_addr as usize) % sram_len] = data;
+                            let sram_addr = ((bank & 0xF) << 15 | addr & 0x7FFF) as usize;
+                            if sram_addr < self.sram.len() {
+                                self.sram[sram_addr] = data;
+                            }
                         }
                     }
                     _ => {
