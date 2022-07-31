@@ -226,14 +226,16 @@ impl Bus {
                     self.wram[offset as usize]
                 }
                 0x2000..=0x20FF => {
-                    panic!("Read unused region: {bank:02X}:{offset:04X}")
+                    warn!("Read unused region: {bank:02X}:{offset:04X}");
+                    0
                 }
                 0x2100..=0x21FF => {
                     ctx.elapse(CYCLES_FAST);
                     self.io_read(ctx, offset)
                 }
                 0x2200..=0x3FFF => {
-                    panic!("Read unused region: {bank:02X}:{offset:04X}")
+                    warn!("Read unused region (open bus): {bank:02X}:{offset:04X}");
+                    0
                 }
                 0x4000..=0x41FF => {
                     ctx.elapse(CYCLES_JOY);
@@ -304,14 +306,14 @@ impl Bus {
                     self.wram[offset as usize] = data;
                 }
                 0x2000..=0x20FF => {
-                    panic!("Write unused region: {bank:02X}:{offset:04X}");
+                    warn!("Write unused region: {bank:02X}:{offset:04X}");
                 }
                 0x2100..=0x21FF => {
                     ctx.elapse(CYCLES_FAST);
                     self.io_write(ctx, offset, data);
                 }
                 0x2200..=0x3FFF => {
-                    panic!("Write unused region: {bank:02X}:{offset:04X}")
+                    warn!("Write unused region: {bank:02X}:{offset:04X}")
                 }
                 0x4000..=0x41FF => {
                     ctx.elapse(CYCLES_JOY);
@@ -360,6 +362,11 @@ impl Bus {
                 let ret = self.wram[self.wram_addr as usize];
                 self.wram_addr = (self.wram_addr + 1) & 0x1FFFF;
                 ret
+            }
+
+            0x2181..=0x3FFF => {
+                warn!("Read open bus: {addr:04X}");
+                0
             }
 
             // CPU On-Chip I/O Ports
@@ -452,7 +459,10 @@ impl Bus {
 
         match addr {
             0x2100..=0x213F => ctx.ppu_write(addr, data),
-            0x2140..=0x217F => ctx.spc_mut().write_port((addr & 3) as _, data),
+            0x2140..=0x217F => {
+                log::debug!("SPC PORT[{}] = {data:02X} @ {}", addr & 3, ctx.now());
+                ctx.spc_mut().write_port((addr & 3) as _, data);
+            }
 
             0x2180 => {
                 self.wram[self.wram_addr as usize] = data;
