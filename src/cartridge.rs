@@ -12,6 +12,10 @@ impl Cartridge {
         }
 
         let sram_size = rom.sram_size;
+        assert!(
+            sram_size == 0 || sram_size.is_power_of_two(),
+            "SRAM size is not power of two: {sram_size:X}"
+        );
 
         Self {
             rom,
@@ -50,12 +54,8 @@ impl Cartridge {
                     0x70..=0x7D | 0xF0..=0xFF => {
                         if addr & 0x8000 == 0 {
                             let sram_addr = ((bank & 0xF) << 15 | addr & 0x7FFF) as usize;
-                            if sram_addr < self.sram.len() {
-                                self.sram[sram_addr]
-                            } else {
-                                // FIXME: Open-bus?
-                                0
-                            }
+                            let sram_len = self.sram.len();
+                            self.sram[sram_addr % sram_len]
                         } else {
                             let rom_addr = ((bank & 0x7F) << 15 | addr & 0x7FFF) as usize;
                             if rom_addr < self.rom.rom.len() {
@@ -96,9 +96,8 @@ impl Cartridge {
                     0x70..=0x7D | 0xF0..=0xFF => {
                         if addr & 0x8000 == 0 {
                             let sram_addr = ((bank & 0xF) << 15 | addr & 0x7FFF) as usize;
-                            if sram_addr < self.sram.len() {
-                                self.sram[sram_addr] = data;
-                            }
+                            let sram_len = self.sram.len();
+                            self.sram[sram_addr % sram_len] = data;
                         }
                     }
                     _ => {

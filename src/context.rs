@@ -15,6 +15,7 @@ pub trait Bus {
     fn read(&mut self, addr: u32) -> u8;
     fn read_pure(&self, addr: u32) -> Option<u8>;
     fn write(&mut self, addr: u32, data: u8);
+    fn bus_locked(&self) -> bool;
     fn bus_tick(&mut self);
 }
 
@@ -84,6 +85,7 @@ pub struct InterruptCtrl {
 
 impl InterruptCtrl {
     pub fn set_nmi_enable(&mut self, enable: bool) {
+        // Disabling NMI does not ack NMI
         let prev = self.nmi_enable && self.nmi_flag;
         self.nmi_enable = enable;
         if !prev && self.nmi_enable && self.nmi_flag {
@@ -181,7 +183,7 @@ impl Bus for Inner1 {
     }
 
     fn read(&mut self, addr: u32) -> u8 {
-        self.bus.read(&mut self.inner, addr)
+        self.bus.read::<_, false>(&mut self.inner, addr)
     }
 
     fn read_pure(&self, addr: u32) -> Option<u8> {
@@ -189,7 +191,11 @@ impl Bus for Inner1 {
     }
 
     fn write(&mut self, addr: u32, data: u8) {
-        self.bus.write(&mut self.inner, addr, data)
+        self.bus.write::<_, false>(&mut self.inner, addr, data)
+    }
+
+    fn bus_locked(&self) -> bool {
+        self.bus.locked()
     }
 
     fn bus_tick(&mut self) {
