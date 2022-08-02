@@ -2,10 +2,13 @@
 
 use crate::dsp::Dsp;
 
-use log::{debug, trace, warn, Level};
+use log::{debug, info, trace, warn, Level};
 use meru_interface::AudioBuffer;
 use modular_bitfield::prelude::*;
-use std::fmt::Display;
+use std::{
+    fmt::Display,
+    sync::atomic::{AtomicU64, Ordering},
+};
 use super_sabicom_macro::opcodes;
 
 use crate::context;
@@ -107,12 +110,23 @@ struct IORegisters {
     counter2: u64,
 }
 
-#[derive(Default, Debug)]
+#[derive(Debug)]
 struct Timer {
     enable: bool,
     divider: u8,
     counter: u8,
     output: u8,
+}
+
+impl Default for Timer {
+    fn default() -> Self {
+        Self {
+            enable: false,
+            divider: 0,
+            counter: 0,
+            output: 0xF,
+        }
+    }
 }
 
 impl Default for IORegisters {
@@ -333,14 +347,14 @@ impl Spc {
                 0
             }
             1 => {
-                warn!("Read CONTROL");
+                // warn!("Read CONTROL");
                 0
             }
             2 => self.ioregs.dsp_reg,
             3 => self.dsp.read(self.ioregs.dsp_reg),
             4..=7 => {
                 let data = self.ioregs.cpuin[addr as usize - 4];
-                trace!("CPUIO {} -> {data:#04X}", addr as usize - 4);
+                debug!("CPUIO {} -> {data:#04X}", addr as usize - 4);
                 data
             }
             8..=9 => self.ioregs.ext_io[addr as usize - 8],
@@ -353,12 +367,12 @@ impl Spc {
             _ => unreachable!(),
         };
 
-        trace!("IO Read:  {addr:X} = {data:#04X}");
+        // debug!("IO Read:  {addr:X} = {data:#04X}");
         data
     }
 
     fn io_write(&mut self, addr: u16, data: u8) {
-        trace!("IO Write: {addr:X} = {data:#04X}");
+        // debug!("IO Write: {addr:X} = {data:#04X}");
 
         match addr {
             0 => {
@@ -367,12 +381,28 @@ impl Spc {
                 // 2: Crash SPC700 (0: Normal, 1: Crashes the CPU)
                 // 3: Timer-Disable (0: Timer don't work, 1: Normal)
 
-                const WS_TBL: [u64; 4] = [0, 1, 4, 9];
+                const WS_TBL: [u64; 4] = [0, 1, 3, 7];
 
                 self.ioregs.ram_write_enable = data & 2 != 0;
                 self.ioregs.crash_spc700 = data & 4 != 0;
+
+                info!("RAM wait cycle: {}", WS_TBL[(data as usize >> 4) & 3]);
+                info!("IO wait cycle: {}", WS_TBL[(data as usize >> 6) & 3]);
+
                 self.ioregs.ram_wait_cycle = WS_TBL[(data as usize >> 4) & 3] + 1;
                 self.ioregs.io_wait_cycle = WS_TBL[(data as usize >> 6) & 3] + 1;
+
+                // FIXME: Detect using large wait cycle progem
+                assert!(
+                    self.ioregs.ram_wait_cycle <= 2,
+                    "Large RAM Wait Cycle: {}",
+                    self.ioregs.ram_wait_cycle
+                );
+                assert!(
+                    self.ioregs.io_wait_cycle <= 2,
+                    "Large IO Wait Cycle: {}",
+                    self.ioregs.io_wait_cycle
+                );
             }
             1 => {
                 for i in 0..3 {
@@ -394,7 +424,7 @@ impl Spc {
             2 => self.ioregs.dsp_reg = data,
             3 => self.dsp.write(self.ioregs.dsp_reg, data),
             4..=7 => {
-                trace!("CPUIO {} <- {data:#04X}", addr as usize - 4);
+                debug!("CPUIO {} <- {data:#04X}", addr as usize - 4);
                 self.ioregs.cpuout[addr as usize - 4] = data
             }
             8..=9 => self.ioregs.ext_io[addr as usize - 8] = data,
@@ -488,7 +518,7 @@ impl Spc {
             }};
             (aaab) => {{
                 let aaab = self.fetch16();
-                (aaab & 0x01FF, aaab >> 13)
+                (aaab & 0x01FFF, aaab >> 13)
             }};
         }
 
@@ -1134,13 +1164,13 @@ impl Spc {
         #[rustfmt::skip]
         macro_rules! cond_branch {
             (pl) => { cond_exec!(!self.regs.psw.n(), io, 2) };
-            (mi) => { cond_exec!(self.regs.psw.n(), ram, 2) };
+            (mi) => { cond_exec!(self.regs.psw.n(), io, 2) };
             (vc) => { cond_exec!(!self.regs.psw.v(), io, 2) };
-            (vs) => { cond_exec!(self.regs.psw.v(), ram, 2) };
+            (vs) => { cond_exec!(self.regs.psw.v(), io, 2) };
             (cc) => { cond_exec!(!self.regs.psw.c(), io, 2) };
-            (cs) => { cond_exec!(self.regs.psw.c(), ram, 2) };
+            (cs) => { cond_exec!(self.regs.psw.c(), io, 2) };
             (ne) => { cond_exec!(!self.regs.psw.z(), io, 2) };
-            (eq) => { cond_exec!(self.regs.psw.z(), ram, 2) };
+            (eq) => { cond_exec!(self.regs.psw.z(), io, 2) };
         }
 
         macro_rules! cond_exec {
