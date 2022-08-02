@@ -17,8 +17,8 @@ const INTERNAL_CYCLE: u64 = 6;
 #[derive(Default)]
 pub struct Cpu {
     pub regs: Registers,
-    stop: bool,
-    halt: bool,
+    pub stop: bool,
+    pub halt: bool,
 }
 
 #[derive(Debug)]
@@ -364,6 +364,7 @@ impl Addr<u32> for Wrap24Addr {
 impl Cpu {
     pub fn reset(&mut self, ctx: &mut impl Context) {
         self.regs = Registers::default();
+        ctx.elapse(170); // FIXME: startup cycle?
         self.regs.pc = Wrap16Addr(RESET_VECTOR as u32).read16(ctx);
     }
 
@@ -468,7 +469,7 @@ impl Cpu {
             panic!("Consistency check failed at cycle = {}", ctx.now());
         }
 
-        if ctx.bus().locked() {
+        if ctx.bus_locked() {
             return;
         }
 
@@ -483,15 +484,19 @@ impl Cpu {
             return;
         }
 
-        if (self.halt || !self.regs.p.i()) && ctx.interrupt().irq() {
+        if !self.regs.p.i() && ctx.interrupt().irq() {
             ctx.elapse(INTERNAL_CYCLE * 2);
             self.exception(ctx, Exception::Irq);
             return;
         }
 
         if self.halt {
-            ctx.elapse(INTERNAL_CYCLE);
-            return;
+            if ctx.interrupt().irq() {
+                self.halt = false;
+            } else {
+                ctx.elapse(INTERNAL_CYCLE);
+                return;
+            }
         }
 
         if log::log_enabled!(log::Level::Trace) {
@@ -666,7 +671,7 @@ impl Cpu {
                     let b = rd!($opr, u16);
                     let a = self.regs.a;
                     self.regs.p.set_z(a & b == 0);
-                    set_nv!($opr, b, u8);
+                    set_nv!($opr, b, u16);
                 }
             }};
 
@@ -699,6 +704,7 @@ impl Cpu {
             // jump
             (jmp disp8) => {{
                 let disp = self.fetch8(ctx) as i8;
+                ctx.elapse(INTERNAL_CYCLE);
                 if self.regs.e && (self.regs.pc & 0xFF) + (disp as u16 & 0xFF) > 0xFF {
                     ctx.elapse(INTERNAL_CYCLE);
                 }
@@ -714,8 +720,9 @@ impl Cpu {
                 self.regs.pc = addr;
             }};
             (jmp abi) => {{
-                // For JMP [nnnn] the operand word cannot cross page boundaries
-                let addr = Wrap8Addr(self.fetch16(ctx) as u32);
+                let addr = Wrap16Addr(self.fetch16(ctx) as u32);
+                // FIXME: I don't know this instruction wraps page boundary or not so testing it
+                assert!(addr.0 & 0xFF != 0xFF);
                 self.regs.pc = addr.read16(ctx);
             }};
             (jmp $addr:ident) => {{
@@ -732,9 +739,14 @@ impl Cpu {
                 self.regs.pb = (addr >> 16) as u8;
                 self.regs.pc = addr as u16;
             }};
-            (jsr $addr:ident) => {{
-                let addr = addr!($addr, false).unwrap();
+            (jsr abs) => {{
+                let addr = addr!(abs, false).unwrap();
                 ctx.elapse(INTERNAL_CYCLE);
+                self.push16(ctx, self.regs.pc.wrapping_sub(1));
+                self.regs.pc = addr as u16;
+            }};
+            (jsr aix) => {{
+                let addr = addr!(aix, false).unwrap();
                 self.push16(ctx, self.regs.pc.wrapping_sub(1));
                 self.regs.pc = addr as u16;
             }};
@@ -788,10 +800,22 @@ impl Cpu {
             // misc
             (brk) => {{
                 let _dmy = self.fetch8(ctx);
+                // FIXME: Is this correct?
+                if self.regs.e {
+                    self.regs.db = 0;
+                }
+                // Detect such code to verify
+                assert!(!self.regs.e, "BRK in emulation mode");
                 self.exception(ctx, Exception::Brk)
             }};
             (cop) => {{
                 let _dmy = self.fetch8(ctx);
+                // FIXME: Is this correct?
+                if self.regs.e {
+                    self.regs.db = 0;
+                }
+                // Detect such code to verify
+                assert!(!self.regs.e, "COP in emulation mode");
                 self.exception(ctx, Exception::Cop)
             }};
 
@@ -1010,30 +1034,44 @@ impl Cpu {
                 if self.regs.p.d() {
                     let a = $a as i32;
                     let b = $b as i32;
-                    let mut cl = (a & 0xF) - (b & 0xF) - borrow as i32;
-                    if cl < 0 {
-                        cl = ((cl - 6) & 0xF) - 0x10;
+
+                    let mut borrow = borrow as i32;
+                    let mut c0 = (a & 0xF) - (b & 0xF) - borrow;
+                    borrow = 0;
+                    if c0 < 0 {
+                        c0 = (c0 - 6) & 0xF;
+                        borrow = 0x10;
                     }
-                    let mut c = (a & 0xF0) - (b & 0xF0) + cl;
-                    if c < 0 {
-                        c = (c - 0x60) & 0xFF - 0x100;
-                    }
+                    let mut c1 = (a & 0xF0) - (b & 0xF0) - borrow;
 
                     macro_rules! calc {
-                        (u8) => {};
-                        (u16) => {
-                            c = (a & 0xF00) - (b & 0xF00) + c;
-                            if c < 0 {
-                                c = (c - 0x600) & 0xFFF - 0x1000;
+                        (u8) => {{
+                            if c1 < 0 {
+                                c1 = (c1 - 0x60) & 0xF0;
                             }
-                            c = (a & 0xF000) - (b & 0xF000) + c;
-                            if c < 0 {
-                                c -= 0x6000;
+                            c1 | c0
+                        }};
+                        (u16) => {{
+                            borrow = 0;
+                            if c1 < 0 {
+                                c1 = (c1 - 0x60) & 0xF0;
+                                borrow = 0x100;
                             }
-                        };
+                            let mut c2 = (a & 0xF00) - (b & 0xF00) - borrow;
+                            borrow = 0;
+                            if c2 < 0 {
+                                c2 = (c2 - 0x600) & 0xF00;
+                                borrow = 0x1000;
+                            }
+                            let mut c3 = (a & 0xF000) - (b & 0xF000) - borrow;
+                            if c3 < 0 {
+                                c3 = (c3 - 0x6000) & 0xF000;
+                            }
+                            c3 | c2 | c1 | c0
+                        }};
                     }
 
-                    calc!($ty);
+                    let c = calc!($ty);
 
                     c as $ty
                 } else {
@@ -1139,10 +1177,11 @@ impl Cpu {
                 let disp = self.fetch8(ctx) as i8 as u16;
                 if cond!($cond) {
                     ctx.elapse(INTERNAL_CYCLE);
-                    if self.regs.e && (self.regs.pc & 0xFF) + (disp & 0xFF) as u16 > 0xFF {
+                    let prev_pc = self.regs.pc;
+                    self.regs.pc = self.regs.pc.wrapping_add(disp);
+                    if self.regs.e && self.regs.pc & 0xFF00 != prev_pc & 0xFF00 {
                         ctx.elapse(INTERNAL_CYCLE);
                     }
-                    self.regs.pc = self.regs.pc.wrapping_add(disp);
                 }
             }};
         }
@@ -1217,7 +1256,7 @@ impl Cpu {
             }};
             (aby, $wr:literal) => {{
                 let addr = addr!(abs, $wr);
-                if $wr || !self.regs.p.x() || (self.regs.x as u32 & 0xFF) + (addr.0 & 0xFF) > 0xFF {
+                if $wr || !self.regs.p.x() || (self.regs.y as u32 & 0xFF) + (addr.0 & 0xFF) > 0xFF {
                     ctx.elapse(INTERNAL_CYCLE);
                 }
                 addr.offset(self.regs.y as u32)
@@ -1237,10 +1276,9 @@ impl Cpu {
             (zp, $_:literal) => {{
                 let offset = self.fetch8(ctx);
                 if self.regs.e && self.regs.d & 0xFF == 0 {
-                    // This case muse be used for 8bit access, so wrapping is not important.
                     Wrap16Addr(self.regs.d as u32 | offset as u32)
                 } else {
-                    if self.regs.d & 0xFF00 != 0 {
+                    if self.regs.d & 0xFF != 0 {
                         ctx.elapse(INTERNAL_CYCLE);
                     }
                     Wrap16Addr(self.regs.d as u32).offset(offset as u16)
@@ -1248,14 +1286,18 @@ impl Cpu {
             }};
             (zpx, $_:literal) => {{
                 let offset = self.fetch8(ctx);
-                if self.regs.e && self.regs.d & 0xFF == 0 {
-                    // This case muse be used for 8bit access, so wrapping is not important.
-                    Wrap16Addr(self.regs.d as u32 | offset.wrapping_add(self.regs.x as u8) as u32)
-                } else {
-                    if self.regs.d & 0xFF00 != 0 {
-                        ctx.elapse(INTERNAL_CYCLE);
-                    }
+                ctx.elapse(INTERNAL_CYCLE);
+                if self.regs.d & 0xFF != 0 {
                     ctx.elapse(INTERNAL_CYCLE);
+                }
+                if self.regs.e {
+                    Wrap16Addr(
+                        Wrap8Addr(self.regs.d as u32)
+                            .offset(offset)
+                            .offset(self.regs.x as u8)
+                            .0,
+                    )
+                } else {
                     Wrap16Addr(self.regs.d as u32)
                         .offset(offset as u16)
                         .offset(self.regs.x)
@@ -1263,14 +1305,18 @@ impl Cpu {
             }};
             (zpy, $_:literal) => {{
                 let offset = self.fetch8(ctx);
-                if self.regs.e && self.regs.d & 0xFF == 0 {
-                    // This case muse be used for 8bit access, so wrapping is not important.
-                    Wrap16Addr(self.regs.d as u32 | offset.wrapping_add(self.regs.y as u8) as u32)
-                } else {
-                    if self.regs.d & 0xFF00 != 0 {
-                        ctx.elapse(INTERNAL_CYCLE);
-                    }
+                ctx.elapse(INTERNAL_CYCLE);
+                if self.regs.d & 0xFF != 0 {
                     ctx.elapse(INTERNAL_CYCLE);
+                }
+                if self.regs.e {
+                    Wrap16Addr(
+                        Wrap8Addr(self.regs.d as u32)
+                            .offset(offset)
+                            .offset(self.regs.y as u8)
+                            .0,
+                    )
+                } else {
                     Wrap16Addr(self.regs.d as u32)
                         .offset(offset as u16)
                         .offset(self.regs.y)
@@ -1286,20 +1332,36 @@ impl Cpu {
             };
             (inx, $_:literal) => {{
                 let offset = self.fetch8(ctx);
-                let addr = if self.regs.e && self.regs.d & 0xFF == 0 {
-                    Wrap8Addr(self.regs.d as u32 | offset.wrapping_add(self.regs.x as u8) as u32)
-                        .read16(ctx)
+                ctx.elapse(INTERNAL_CYCLE);
+                let addr = if self.regs.e {
+                    if self.regs.d & 0xFF != 0 {
+                        ctx.elapse(INTERNAL_CYCLE);
+                    }
+                    // Wraps 8 bit to add offset and X,
+                    // but does not wrap 8 bit to read indirect address
+                    Wrap16Addr(
+                        Wrap8Addr(self.regs.d as u32)
+                            .offset(offset)
+                            .offset(self.regs.x as u8)
+                            .unwrap(),
+                    )
+                    .read16(ctx)
                 } else {
+                    if self.regs.d & 0xFF != 0 {
+                        ctx.elapse(INTERNAL_CYCLE);
+                    }
                     Wrap16Addr(self.regs.d as u32)
                         .offset(offset as u16)
                         .offset(self.regs.x)
                         .read16(ctx)
                 };
-                ctx.elapse(INTERNAL_CYCLE);
                 Wrap24Addr((self.regs.db as u32) << 16 | addr as u32)
             }};
             (iny, $wr:literal) => {{
                 let offset = self.fetch8(ctx);
+                if self.regs.d & 0xFF != 0 {
+                    ctx.elapse(INTERNAL_CYCLE);
+                }
                 let addr = if self.regs.e && self.regs.d & 0xFF == 0 {
                     Wrap8Addr(self.regs.d as u32 | offset as u32).read16(ctx)
                 } else {
@@ -1307,13 +1369,16 @@ impl Cpu {
                         .offset(offset as u16)
                         .read16(ctx)
                 };
-                if $wr || !self.regs.p.x() || (self.regs.x & 0xFF) + (addr & 0xFF) > 0xFF {
+                if $wr || !self.regs.p.x() || (addr & 0xFF) + (self.regs.y & 0xFF) > 0xFF {
                     ctx.elapse(INTERNAL_CYCLE);
                 }
                 Wrap24Addr((self.regs.db as u32) << 16 | addr as u32).offset(self.regs.y as u32)
             }};
             (ify, $_:literal) => {{
                 let offset = self.fetch8(ctx);
+                if self.regs.d & 0xFF != 0 {
+                    ctx.elapse(INTERNAL_CYCLE);
+                }
                 let addr = if self.regs.e && self.regs.d & 0xFF == 0 {
                     Wrap8Addr(self.regs.d as u32 | offset as u32).read24(ctx)
                 } else {
