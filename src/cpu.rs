@@ -14,11 +14,22 @@ const RESET_VECTOR: u16 = 0xFFFC;
 
 const INTERNAL_CYCLE: u64 = 6;
 
-#[derive(Default)]
 pub struct Cpu {
     pub regs: Registers,
     pub stop: bool,
     pub halt: bool,
+    prev_i: bool,
+}
+
+impl Default for Cpu {
+    fn default() -> Self {
+        Self {
+            regs: Registers::default(),
+            stop: false,
+            halt: false,
+            prev_i: true,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -430,6 +441,7 @@ impl Cpu {
 
         self.regs.p.set_d(false);
         self.regs.p.set_i(true);
+        self.prev_i = true;
         self.regs.pb = 0;
         self.regs.pc = Wrap16Addr(e.vector_addr(self.regs.e) as u32).read16(ctx);
     }
@@ -469,6 +481,9 @@ impl Cpu {
             panic!("Consistency check failed at cycle = {}", ctx.now());
         }
 
+        let prev_i = self.prev_i;
+        self.prev_i = self.regs.p.i();
+
         if ctx.bus_locked() {
             return;
         }
@@ -484,7 +499,7 @@ impl Cpu {
             return;
         }
 
-        if !self.regs.p.i() && ctx.interrupt().irq() {
+        if !prev_i && ctx.interrupt().irq() {
             ctx.elapse(INTERNAL_CYCLE * 2);
             self.exception(ctx, Exception::Irq);
             return;
@@ -755,6 +770,7 @@ impl Cpu {
                 ctx.elapse(INTERNAL_CYCLE * 2);
                 let p = self.pop8(ctx);
                 self.regs.set_p(p);
+                self.prev_i = self.regs.p.i();
                 self.regs.pc = self.pop16(ctx);
                 if !self.regs.e {
                     self.regs.pb = self.pop8(ctx);
@@ -805,7 +821,13 @@ impl Cpu {
                     self.regs.db = 0;
                 }
                 // Detect such code to verify
-                assert!(!self.regs.e, "BRK in emulation mode");
+                assert!(
+                    !self.regs.e,
+                    "BRK in emulation mode: PC: {:02X}:{:04X}, cycle: {}",
+                    self.regs.pb,
+                    self.regs.pc,
+                    ctx.now()
+                );
                 self.exception(ctx, Exception::Brk)
             }};
             (cop) => {{
@@ -1426,9 +1448,8 @@ impl Cpu {
             },
         );
 
-        use crate::consts::*;
         trace!(
-            "{:02X}:{:04X}  {asm:32} A:{:04X} X:{:04X} Y:{:04X} S:{:04X} D:{:04X} DB:{:02X} PB:{:02X} P:{}{}{}{}{}{}{}{}{} @{frame}:{y:03}:{x:03}.{frac}",
+            "{:02X}:{:04X}  {asm:32} A:{:04X} X:{:04X} Y:{:04X} S:{:04X} D:{:04X} DB:{:02X} PB:{:02X} P:{}{}{}{}{}{}{}{}{} @{frame}:{y:03}:{x:03}",
             self.regs.pb,
             self.regs.pc,
             self.regs.a,
@@ -1447,10 +1468,9 @@ impl Cpu {
             if self.regs.p.i() {'I'} else {'i'},
             if self.regs.p.z() {'Z'} else {'z'},
             if self.regs.p.c() {'C'} else {'c'},
-            frame = ctx.now() / CYCLES_PER_DOT as u64 / DOTS_PER_LINE as u64 / LINES_PER_FRAME as u64,
-            y = ctx.now() / CYCLES_PER_DOT as u64 / DOTS_PER_LINE as u64 % LINES_PER_FRAME as u64,
-            x = ctx.now() / CYCLES_PER_DOT as u64 % DOTS_PER_LINE as u64,
-            frac = ctx.now() % CYCLES_PER_DOT as u64,
+            frame = ctx.counter().frame,
+            x = ctx.counter().x,
+            y = ctx.counter().y,
         );
     }
 
