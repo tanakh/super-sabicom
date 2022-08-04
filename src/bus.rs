@@ -41,7 +41,7 @@ pub struct Bus {
 }
 
 #[bitfield(bits = 8)]
-#[derive(Default)]
+#[derive(Default, Debug)]
 struct InterruptEnable {
     joypad_enable: bool, // Enable Automatic Reading of Joypad
     #[skip]
@@ -135,13 +135,6 @@ enum DmaTransferDir {
     #[default]
     CpuToIo = 0,
     IoToCpu = 1,
-}
-
-#[bitfield(bits = 8)]
-#[derive(Default)]
-struct HdmaLineCounter {
-    num: B7,
-    repeat: bool,
 }
 
 impl Default for Bus {
@@ -410,6 +403,10 @@ impl Bus {
     }
 
     fn io_read(&mut self, ctx: &mut impl Context, addr: u16) -> u8 {
+        // Sync PPU counter
+        // FIXME: render flag
+        ctx.ppu_tick(true);
+
         let data = match addr {
             0x2100..=0x213F => ctx.ppu_read(addr),
             0x2140..=0x217F => ctx.spc().read_port((addr & 3) as _),
@@ -548,6 +545,7 @@ impl Bus {
                 let interrupt = ctx.interrupt_mut();
                 interrupt.set_nmi_enable(self.interrupt_enable.vblank_nmi_enable());
                 interrupt.set_hvirq_enable(self.interrupt_enable.hvirq_enable());
+                log::debug!("NMITIMEN = {:?}", self.interrupt_enable);
             }
             0x4201 => {
                 self.controller_port[0].enable = data & (1 << 6) != 0;
@@ -558,8 +556,9 @@ impl Bus {
                 self.mul_b = data;
                 // info!("Start mul: {:#04X}x{:#04X}", self.mul_a, self.mul_b);
                 // FIXME: Delay 8 cycles
-                // NOTE: This destroys div_quot
+                // FIXME: Write during mul should clear intermediate result
                 self.div_rem_or_mul = self.mul_a as u16 * self.mul_b as u16;
+                self.div_quot = self.mul_b as u16;
             }
             0x4204 => self.div_a = self.div_a & 0xFF00 | data as u16,
             0x4205 => self.div_a = self.div_a & 0x00FF | ((data as u16) << 8),

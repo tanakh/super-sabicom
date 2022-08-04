@@ -6,7 +6,7 @@ pub struct Cartridge {
 }
 
 impl Cartridge {
-    pub fn new(rom: Rom) -> Self {
+    pub fn new(rom: Rom, backup: Option<&[u8]>) -> Self {
         if let Some(coprocessor) = &rom.chipset.coprocessor {
             todo!("Coprocessor {coprocessor:?} support");
         }
@@ -17,9 +17,34 @@ impl Cartridge {
             "SRAM size is not power of two: {sram_size:X}"
         );
 
-        Self {
-            rom,
-            sram: vec![0; sram_size],
+        let sram = if let Some(backup) = backup {
+            if !rom.chipset.has_battery {
+                panic!("Cartridge has no battery backup, but backup data is provided");
+            }
+            if !rom.chipset.has_ram {
+                panic!("Cartridge has no SRAM, but backup data is provided");
+            }
+            if rom.sram_size != backup.len() {
+                panic!(
+                    "Backup's SRAM size mismatch: actual: {}, expected: {}",
+                    backup.len(),
+                    rom.sram_size
+                );
+            }
+
+            backup.to_vec()
+        } else {
+            vec![0; sram_size]
+        };
+
+        Self { rom, sram }
+    }
+
+    pub fn backup(&self) -> Option<Vec<u8>> {
+        if self.rom.chipset.has_battery {
+            Some(self.sram.clone())
+        } else {
+            None
         }
     }
 

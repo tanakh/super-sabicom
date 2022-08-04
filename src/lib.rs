@@ -19,9 +19,9 @@ pub struct Snes {
 }
 
 impl Snes {
-    pub fn new(rom: Rom) -> Self {
+    pub fn new(rom: Rom, backup: Option<&[u8]>) -> Self {
         Self {
-            ctx: Context::from_rom(rom),
+            ctx: Context::from_rom(rom, backup),
         }
     }
 }
@@ -52,7 +52,7 @@ impl EmulatorCore for Snes {
         backup: Option<&[u8]>,
         config: &Self::Config,
     ) -> anyhow::Result<Self> {
-        Ok(Snes::new(rom::Rom::from_bytes(&data)?))
+        Ok(Snes::new(rom::Rom::from_bytes(&data)?, backup))
     }
 
     fn game_info(&self) -> Vec<(String, String)> {
@@ -137,7 +137,8 @@ impl EmulatorCore for Snes {
     }
 
     fn backup(&self) -> Option<Vec<u8>> {
-        None
+        use context::Cartridge;
+        self.ctx.cartridge().backup()
     }
 
     fn save_state(&self) -> Vec<u8> {

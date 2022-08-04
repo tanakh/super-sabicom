@@ -23,6 +23,8 @@ use sdl2::{
 
 use super_sabicom::Snes;
 
+const EMULATOR_NAME: &str = "super-sabicom";
+
 #[argopt::cmd]
 fn main(rom: PathBuf) -> Result<()> {
     use std::io::Write;
@@ -72,7 +74,7 @@ fn load_rom_file(path: &Path) -> Result<Vec<u8>> {
 fn backup_dir() -> Result<PathBuf> {
     let data_dir = dirs::data_dir()
         .ok_or_else(|| anyhow!("Could not find data directory"))?
-        .join("tgba");
+        .join(EMULATOR_NAME);
 
     if data_dir.exists() {
         if !data_dir.is_dir() {
@@ -121,7 +123,8 @@ const SCALING: u32 = 2;
 
 fn run(rom_path: &Path) -> Result<()> {
     let bytes = load_rom_file(&rom_path)?;
-    let mut snes = Snes::try_from_file(&bytes, None, &Default::default())?;
+    let backup = load_backup(&rom_path)?;
+    let mut snes = Snes::try_from_file(&bytes, backup.as_deref(), &Default::default())?;
 
     print_game_info(&snes);
 
@@ -223,11 +226,11 @@ fn run(rom_path: &Path) -> Result<()> {
         canvas.present();
 
         let audio_buf = snes.audio_buffer();
-        assert!(
-            (532..=534).contains(&audio_buf.samples.len()),
-            "invalid generated audio length: {}",
-            audio_buf.samples.len()
-        );
+        // assert!(
+        //     (532..=534).contains(&audio_buf.samples.len()),
+        //     "invalid generated audio length: {}",
+        //     audio_buf.samples.len()
+        // );
 
         // Sync to audio
         while audio_queue.size() > SOUND_BUF_LEN as u32 * 4 {

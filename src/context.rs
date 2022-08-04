@@ -53,6 +53,8 @@ pub trait Interrupt {
 pub trait Timing {
     fn now(&self) -> u64;
     fn elapse(&mut self, clock: u64);
+    fn counter(&self) -> &Counter;
+    fn counter_mut(&mut self) -> &mut Counter;
 }
 
 #[context]
@@ -69,7 +71,7 @@ pub struct Context {
 
     #[split(Inner3: Interrupt + Timing)]
     interrupt: InterruptCtrl,
-    counter: u64,
+    counter: Counter,
 }
 
 #[derive(Default)]
@@ -81,6 +83,14 @@ pub struct InterruptCtrl {
     h_count: u16,
     v_count: u16,
     irq: bool,
+}
+
+#[derive(Default)]
+pub struct Counter {
+    counter: u64,
+    pub frame: u64,
+    pub x: u32,
+    pub y: u32,
 }
 
 impl InterruptCtrl {
@@ -102,7 +112,7 @@ impl InterruptCtrl {
     pub fn set_nmi_flag(&mut self, nmi: bool) {
         let prev = self.nmi_enable && self.nmi_flag;
         self.nmi_flag = nmi;
-        if !prev && self.nmi_enable && self.nmi_flag {
+        if self.nmi_enable && !prev && self.nmi_flag {
             self.nmi = true;
         }
     }
@@ -150,14 +160,22 @@ impl InterruptCtrl {
 }
 
 impl Context {
-    pub fn from_rom(rom: rom::Rom) -> Self {
+    pub fn from_rom(rom: rom::Rom, backup: Option<&[u8]>) -> Self {
         let cpu = cpu::Cpu::default();
         let bus = bus::Bus::default();
         let ppu = ppu::Ppu::default();
         let spc = spc::Spc::default();
-        let cartridge = cartridge::Cartridge::new(rom);
+        let cartridge = cartridge::Cartridge::new(rom, backup);
 
-        let mut ret = Self::new(cpu, bus, ppu, spc, cartridge, Default::default(), 0);
+        let mut ret = Self::new(
+            cpu,
+            bus,
+            ppu,
+            spc,
+            cartridge,
+            Default::default(),
+            Default::default(),
+        );
         ret.reset();
 
         ret
@@ -257,9 +275,16 @@ impl Interrupt for Inner3 {
 
 impl Timing for Inner3 {
     fn now(&self) -> u64 {
-        self.counter
+        self.counter.counter
     }
     fn elapse(&mut self, clock: u64) {
-        self.counter += clock;
+        self.counter.counter += clock;
+    }
+
+    fn counter(&self) -> &Counter {
+        &self.counter
+    }
+    fn counter_mut(&mut self) -> &mut Counter {
+        &mut self.counter
     }
 }
