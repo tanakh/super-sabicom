@@ -15,6 +15,8 @@ pub struct Rom {
     pub developer_id: u8,
     pub game_code: Option<[u8; 4]>,
     pub rom_version: u8,
+    pub checksum: u16,
+    pub checksum_correct: bool,
     pub rom: Vec<u8>,
 }
 
@@ -217,6 +219,12 @@ pub enum RomError {
     InvalidRomSize,
     #[error("invalid title string")]
     InvalidTitleString,
+    #[error("invalid rom size code: {0}")]
+    InvalidRomSizeCode(u8),
+    #[error("invalid sram size code: {0}")]
+    InvalidSramSizeCode(u8),
+    #[error("invalid checksum: {0:04X} (complement: {1:04X})")]
+    InvalidChecksum(u16, u16),
     #[error("unknown rom type")]
     UnknownRomType,
 }
@@ -235,9 +243,10 @@ impl Rom {
             (true, rom)
         } else if let Ok(rom) = try_from_bytes(bytes, 0xFF00, true) {
             (false, rom)
+        } else if let Ok(rom) = try_from_bytes(bytes, 0x7F00, false) {
+            (true, rom)
         } else {
-            // Fallback to LoROM
-            (true, try_from_bytes(bytes, 0x7F00, false)?)
+            (false, try_from_bytes(bytes, 0xFF00, false)?)
         };
 
         if header_pos_first != matches!(rom.map_mode, MapMode::LoRom) {
@@ -275,7 +284,10 @@ fn try_from_bytes(bytes: &[u8], header_pos: usize, strict: bool) -> Result<Rom, 
     let v = header[0xD5];
 
     if v & 0xE0 != 0x20 {
-        warn!("Invalid data in header at 0xFFD5: {v:#04X}");
+        warn!(
+            "Invalid data in header at {:#06X}: {v:#04X}",
+            header_pos + 0xD5,
+        );
     }
 
     let speed = Speed::from((v >> 4) & 1);
@@ -292,7 +304,8 @@ fn try_from_bytes(bytes: &[u8], header_pos: usize, strict: bool) -> Result<Rom, 
 
     let rom_size_code = header[0xD7];
     if rom_size_code >= 0xD {
-        todo!("Too large rom size in header: {rom_size_code}");
+        warn!("Invalid rom size code: {rom_size_code:X}");
+        Err(RomError::InvalidRomSizeCode(rom_size_code))?;
     }
 
     let rom_size = (1 << rom_size_code) * 1024;
@@ -312,14 +325,15 @@ fn try_from_bytes(bytes: &[u8], header_pos: usize, strict: bool) -> Result<Rom, 
 
     let ram_size_code = header[0xD8];
     if ram_size_code > 9 {
-        warn!("Too large ram size in header: {ram_size_code:#04X}");
+        warn!("Invalid sram size code: {ram_size_code:X}");
+        Err(RomError::InvalidSramSizeCode(ram_size_code))?;
     }
 
     let sram_size = if ram_size_code == 0 {
         0
     } else {
         if !chipset.has_ram {
-            panic!("Chipset does not have sram, but header's sram size is not 0");
+            Err(RomError::InvalidSramSizeCode(ram_size_code))?;
         }
         1 << (10 + ram_size_code as u32)
     };
@@ -338,6 +352,34 @@ fn try_from_bytes(bytes: &[u8], header_pos: usize, strict: bool) -> Result<Rom, 
 
     // TODO: test checksum
 
+    let checksum_comp = u16::from_le_bytes(header[0xDC..0xDE].try_into().unwrap());
+    let checksum = u16::from_le_bytes(header[0xDE..0xE0].try_into().unwrap());
+
+    if checksum_comp != !checksum {
+        // if strict {
+        warn!("Checksum complement is not complement of checksum: {checksum_comp:04X}^0xFFFF != {checksum:04X}");
+        Err(RomError::InvalidChecksum(checksum, checksum_comp))?;
+        // }
+    }
+
+    let mut actual_sum = 0_u16;
+    for i in 0..bytes.len() {
+        let b = if (0xDC..0xDE).contains(&i) {
+            0xFF
+        } else if (0xDE..0xE0).contains(&i) {
+            0
+        } else {
+            bytes[i]
+        };
+        actual_sum = actual_sum.wrapping_add(b as u16);
+    }
+
+    let checksum_correct = actual_sum == checksum;
+
+    if !checksum_correct {
+        warn!("Checksum incorrect: expected: {checksum:04X}, actual: {actual_sum:04X}");
+    }
+
     Ok(Rom {
         title,
         speed,
@@ -349,6 +391,8 @@ fn try_from_bytes(bytes: &[u8], header_pos: usize, strict: bool) -> Result<Rom, 
         developer_id,
         game_code,
         rom_version,
+        checksum,
+        checksum_correct,
         rom: bytes.to_vec(),
     })
 }
