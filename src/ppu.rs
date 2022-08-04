@@ -64,6 +64,9 @@ pub struct Ppu {
     hdma_reload: bool,
     hdma_transfer: bool,
 
+    mosaic_vofs: [u8; 4],
+    mosaic_vsize: [u8; 4],
+
     h_latch: u32,
     h_flipflop: bool,
     v_latch: u32,
@@ -255,8 +258,8 @@ impl BgMode {
 #[bitfield(bits = 8)]
 #[derive(Default)]
 struct Mosaic {
-    size: B4,
     enable: B4,
+    size: B4,
 }
 
 #[bitfield(bits = 8)]
@@ -264,6 +267,17 @@ struct Mosaic {
 struct ScreenBaseAndSize {
     size: ScreenSize,
     base_addr: B6,
+}
+
+impl ScreenBaseAndSize {
+    fn screen_size(&self) -> (usize, usize) {
+        match self.size() {
+            ScreenSize::OneScreen => (1, 1),
+            ScreenSize::VMirror => (2, 1),
+            ScreenSize::HMirror => (1, 2),
+            ScreenSize::FourScren => (2, 2),
+        }
+    }
 }
 
 #[derive(BitfieldSpecifier)]
@@ -458,28 +472,38 @@ impl Ppu {
     pub fn tick(&mut self, ctx: &mut impl Context, render: bool) {
         let now = ctx.now();
 
-        while self.counter + CYCLES_PER_DOT as u64 <= now {
-            self.counter += CYCLES_PER_DOT as u64;
+        loop {
+            let short_line =
+                self.display_ctrl.v_scanning() == 0 && self.frame % 2 == 1 && self.y == 240;
+            let dot_cycle = if short_line || self.x != 323 && self.x != 327 {
+                4
+            } else {
+                6
+            };
+
+            if self.counter + dot_cycle > now {
+                break;
+            }
+
+            self.counter += dot_cycle;
+
+            let extra_line = self.display_ctrl.v_scanning() == 1 && self.frame % 2 == 0;
+            let lines_per_frame = if extra_line { 263 } else { 262 };
 
             self.x += 1;
-            if self.x == DOTS_PER_LINE {
+            if self.x == 340 {
                 self.x = 0;
                 self.y += 1;
 
-                if self.y == LINES_PER_FRAME {
+                if self.y >= lines_per_frame {
                     self.y = 0;
                     self.frame += 1;
                     debug!("Start Frame: {}", self.frame);
 
                     // End of VBlank
-
                     self.vblank = false;
                     ctx.interrupt_mut().set_nmi_flag(false);
-
-                    if !self.display_ctrl.force_blank() {
-                        self.obj_range_overflow = false;
-                        self.obj_time_overflow = false;
-                    }
+                    self.start_frame();
                 }
 
                 debug!("Line: {}:{}", self.frame, self.y);
@@ -527,19 +551,42 @@ impl Ppu {
                 self.hdma_transfer = true;
             }
 
+            // CPU's vcount wraps to 0 one dot in advance.
+            // This cause double IRQ at H=339, V=0 and no IRQ at H=339, V=261.
+            let (x, y) = if (self.x, self.y) == (339, lines_per_frame - 1) {
+                (self.x, 0)
+            } else if short_line && self.x == 339 {
+                (338, self.y)
+            } else {
+                (self.x, self.y)
+            };
+
             let raise_irq = match ctx.interrupt().hvirq_enable() {
-                1 => self.x == (ctx.interrupt().h_count() as u32 + 4),
-                2 => self.x == 3 && self.y == ctx.interrupt().v_count() as u32,
+                1 => {
+                    // FIXME: delay 3.5 dot
+                    x == ctx.interrupt().h_count() as u32
+                }
+                2 => {
+                    // FIXME: delay 2.5 dot
+                    x == 0 && y == ctx.interrupt().v_count() as u32
+                }
                 3 => {
-                    self.x == (ctx.interrupt().h_count() as u32 + 4)
-                        && self.y == ctx.interrupt().v_count() as u32
+                    // FIXME: delay 3.5 dot (2.5 dot when h_count == 0)
+                    x == ctx.interrupt().h_count() as u32 && y == ctx.interrupt().v_count() as u32
                 }
                 _ => false,
             };
+
             if raise_irq {
+                log::info!("Set IRQ @ ({}, {})", x, y);
                 ctx.interrupt_mut().set_irq(true);
             }
         }
+
+        let counter = ctx.counter_mut();
+        counter.frame = self.frame;
+        counter.x = self.x;
+        counter.y = self.y;
     }
 
     pub fn read(&mut self, ctx: &mut impl Context, addr: u16) -> u8 {
@@ -551,6 +598,7 @@ impl Ppu {
             0x2134 => self.mul_result as u8,
             0x2135 => (self.mul_result >> 8) as u8,
             0x2136 => (self.mul_result >> 16) as u8,
+
             // 0x2137 - SLHV    - "PPU1 Latch H/V-Counter by Software (Read=Strobe)"
             0x2137 => {
                 self.hv_latched = true;
@@ -598,7 +646,6 @@ impl Ppu {
             }
             // 0x213C - OPHCT   - "PPU2 Horizontal Counter Latch (read-twice)"
             0x213C => {
-                self.hv_latched = false; // ??
                 self.h_flipflop = !self.h_flipflop;
                 if self.h_flipflop {
                     self.h_latch as u8
@@ -609,7 +656,6 @@ impl Ppu {
             }
             // 0x213D - OPVCT   - "PPU2 Vertical Counter Latch   (read-twice)"
             0x213D => {
-                self.hv_latched = false; // ??
                 self.v_flipflop = !self.v_flipflop;
                 if self.v_flipflop {
                     self.v_latch as u8
@@ -651,6 +697,7 @@ impl Ppu {
                 ret |= (self.hv_latched as u8) << 6;
                 ret |= ((self.frame & 1) as u8) << 7;
 
+                self.hv_latched = false;
                 self.h_flipflop = false;
                 self.v_flipflop = false;
 
@@ -842,6 +889,26 @@ struct BgMapEntry {
     y_flip: bool,
 }
 
+#[bitfield(bits = 16)]
+struct BgOptEntry {
+    offset: B10,
+    #[skip]
+    __: B3,
+    apply_to_bg1: bool,
+    apply_to_bg2: bool,
+    apply_to_v: bool, // Only for Mode 4
+}
+
+impl BgOptEntry {
+    fn apply_to_bg(&self, bg: usize) -> bool {
+        if bg == 0 {
+            self.apply_to_bg1()
+        } else {
+            self.apply_to_bg2()
+        }
+    }
+}
+
 #[bitfield(bits = 32)]
 struct ObjEntry {
     x: u8,
@@ -976,6 +1043,18 @@ const PIXEL_KIND_OBJ_LOPAL: u8 = 6;
 const PIXEL_KIND_BACKDROP: u8 = 5;
 
 impl Ppu {
+    fn start_frame(&mut self) {
+        if !self.display_ctrl.force_blank() {
+            self.obj_range_overflow = false;
+            self.obj_time_overflow = false;
+        }
+
+        for i in 0..4 {
+            self.mosaic_vofs[i] = 0;
+            self.mosaic_vsize[i] = 0;
+        }
+    }
+
     fn render_line(&mut self, y: u32) {
         if self.display_ctrl.force_blank() {
             self.line_buffer_main.fill(0);
@@ -1020,14 +1099,26 @@ impl Ppu {
                     self.render_bg(y, 2, 2, 11, 0, 0x00);
                 }
             }
-            2 => todo!("BG Mode 2"),
+            2 => {
+                self.render_bg(y, 0, 4, 11, 5, 0x00);
+                self.render_bg(y, 1, 4, 8, 2, 0x00);
+            }
             3 => {
                 self.render_bg(y, 0, 8, 8, 2, 0x00);
                 self.render_bg(y, 1, 4, 11, 5, 0x00);
             }
-            4 => todo!("BG Mode 4"),
-            5 => todo!("BG Mode 5"),
-            6 => todo!("BG Mode 6"),
+            4 => {
+                self.render_bg(y, 0, 8, 8, 2, 0x00);
+                self.render_bg(y, 1, 2, 11, 5, 0x00);
+            }
+            5 => {
+                // TODO
+                todo!("BG Mode 5")
+            }
+            6 => {
+                // TODO
+                todo!("BG Mode 6")
+            }
             7 => {
                 self.render_bg_mode7(y, 8);
                 // TODO: EXTBG
@@ -1071,6 +1162,11 @@ impl Ppu {
 
         let win_calc = self.win_calc_bg(i);
 
+        let offset_per_tile = match self.bg_mode.mode() {
+            2 | 4 | 6 => true,
+            _ => false,
+        };
+
         // FIXME: base_addr is 6bit (0x3F * 2K = 126K), but VRAM is 64KB ???
         let sc_base_addr = self.bg_sc[i].base_addr() as usize * 2 * 1024;
         let tile_base_addr = self.bg_tile_base_addr[i] as usize * 8 * 1024;
@@ -1078,20 +1174,26 @@ impl Ppu {
         let hofs = (self.bg_hofs[i] & 0x3FF) as usize;
         let vofs = (self.bg_vofs[i] & 0x3FF) as usize;
 
-        // TODO: mosaic
+        let (mosaic_vofs, mosaic_hsize) = if self.mosaic.enable() & (1 << i) != 0 {
+            let mosaic_vofs = self.mosaic_vofs[i];
+            if self.mosaic_vofs[i] >= self.mosaic_vsize[i] {
+                self.mosaic_vofs[i] = 0;
+                self.mosaic_vsize[i] = self.mosaic.size();
+            } else {
+                self.mosaic_vofs[i] += 1;
+            }
+            (mosaic_vofs, self.mosaic.size())
+        } else {
+            self.mosaic_vofs[i] = 0;
+            self.mosaic_vsize[i] = 0;
+            (0, 0)
+        };
+
+        let sy = y as usize + vofs - mosaic_vofs as usize;
 
         let pal_size = 1 << bpp;
 
-        let (sc_w, sc_h) = match self.bg_sc[i].size() {
-            ScreenSize::OneScreen => (1, 1),
-            ScreenSize::VMirror => (2, 1),
-            ScreenSize::HMirror => (1, 2),
-            ScreenSize::FourScren => (2, 2),
-        };
-
-        let sy = y as usize + vofs;
-
-        const SC_SIZE: usize = 32 * 32 * 2;
+        let (sc_w, sc_h) = self.bg_sc[i].screen_size();
 
         let pixel_kind = match i {
             0 => PIXEL_KIND_BG1,
@@ -1100,6 +1202,16 @@ impl Ppu {
             3 => PIXEL_KIND_BG4,
             _ => unreachable!(),
         };
+
+        let mut mosaic_hofs = 0;
+
+        // For offset-per-tile mode
+        let first_tile = hofs / TILE_SIZE;
+        let bg3_hofs = (self.bg_hofs[2] & 0x3FF) as usize;
+        let bg3_vofs = (self.bg_vofs[2] & 0x3FF) as usize;
+        let (bg3_sc_w, bg3_sc_h) = self.bg_sc[2].screen_size();
+        let bg3_base_addr = self.bg_sc[2].base_addr() as usize * 2 * 1024;
+        let bg3_tile_size = if !self.bg_mode.tile_size(2) { 8 } else { 16 };
 
         // FIXME: optimize
         for x in 0..SCREEN_WIDTH {
@@ -1110,17 +1222,81 @@ impl Ppu {
                 continue;
             }
 
-            let sx = x as usize + hofs;
-            let sc_x = sx / TILE_SIZE / 32 % sc_w;
-            let sc_y = sy / TILE_SIZE / 32 % sc_h;
-            let tile_x = sx / TILE_SIZE % 32;
-            let tile_y = sy / TILE_SIZE % 32;
+            let sx = x as usize + hofs - mosaic_hofs;
+            mosaic_hofs += 1;
+            if mosaic_hofs > mosaic_hsize as usize {
+                mosaic_hofs = 0;
+            }
 
-            let sc_addr = sc_base_addr + (sc_x + sc_y * sc_w) * SC_SIZE;
-            let entry_addr = (sc_addr + (tile_x + tile_y * 32) * 2) & 0xFFFE;
+            let (sx, sy) = if offset_per_tile && first_tile != (sx / TILE_SIZE) {
+                if self.bg_mode.mode() == 2 {
+                    // Hval = GetTile(BG3, (HOFS&7)|(((X-8)&~7)+(BG3HOFS&~7)), BG3VOFS)
+                    let h_val = BgOptEntry::from_bytes(self.get_tile(
+                        2,
+                        ((x.wrapping_sub(8) & !7).wrapping_add(bg3_hofs as u32 & !7)) as usize,
+                        bg3_vofs,
+                        bg3_sc_w,
+                        bg3_sc_h,
+                        bg3_base_addr,
+                        bg3_tile_size,
+                    ));
+                    // Vval = GetTile(BG3, (HOFS&7)|(((X-8)&~7)+(BG3HOFS&~7)), BG3VOFS + 8)
+                    let v_val = BgOptEntry::from_bytes(self.get_tile(
+                        2,
+                        ((x.wrapping_sub(8) & !7).wrapping_add(bg3_hofs as u32 & !7)) as usize,
+                        bg3_vofs + 8,
+                        bg3_sc_w,
+                        bg3_sc_h,
+                        bg3_base_addr,
+                        bg3_tile_size,
+                    ));
+                    // if(Hval&ValidBit) HOFS = (HOFS&7) | ((X&~7) + (Hval&~7))
+                    let sx = if h_val.apply_to_bg(i) {
+                        (sx & 7) | ((x & !7) + h_val.offset() as u32 & !7) as usize
+                    } else {
+                        sx
+                    };
+                    // if(Vval&ValidBit) VOFS = Y + Vval
+                    let sy = if v_val.apply_to_bg(i) {
+                        y as usize + v_val.offset() as usize
+                    } else {
+                        sy
+                    };
+                    (sx, sy)
+                } else if self.bg_mode.mode() == 4 {
+                    let val = BgOptEntry::from_bytes(self.get_tile(
+                        2,
+                        (sx & 7)
+                            | ((x.wrapping_sub(8) & !7).wrapping_add(bg3_hofs as u32 & !7))
+                                as usize,
+                        bg3_vofs,
+                        bg3_sc_w,
+                        bg3_sc_h,
+                        bg3_base_addr,
+                        bg3_tile_size,
+                    ));
+                    // if(Hval&ValidBit) HOFS = (HOFS&7) | ((X&~7) + (Hval&~7))
+                    let sx = if !val.apply_to_v() {
+                        (sx & 7) | ((x & !7) + val.offset() as u32 & !7) as usize
+                    } else {
+                        sx
+                    };
+                    // if(Vval&ValidBit) VOFS = Y + Vval
+                    let sy = if val.apply_to_v() {
+                        y as usize + val.offset() as usize
+                    } else {
+                        sy
+                    };
+                    (sx, sy)
+                } else {
+                    todo!()
+                }
+            } else {
+                (sx, sy)
+            };
 
-            let entry =
-                BgMapEntry::from_bytes(self.vram[entry_addr..entry_addr + 2].try_into().unwrap());
+            let entry = self.get_tile(i, sx, sy, sc_w, sc_h, sc_base_addr, TILE_SIZE);
+            let entry = BgMapEntry::from_bytes(entry);
 
             let pixel_x = (sx % TILE_SIZE) ^ if !entry.x_flip() { 0 } else { TILE_SIZE - 1 };
             let pixel_y = (sy % TILE_SIZE) ^ if !entry.y_flip() { 0 } else { TILE_SIZE - 1 };
@@ -1154,6 +1330,29 @@ impl Ppu {
                 }
             }
         }
+    }
+
+    fn get_tile(
+        &self,
+        bg: usize,
+        x: usize,
+        y: usize,
+        sw: usize,
+        sh: usize,
+        base_addr: usize,
+        tile_size: usize,
+    ) -> [u8; 2] {
+        const SC_SIZE: usize = 32 * 32 * 2;
+
+        let sc_x = x / tile_size / 32 % sw;
+        let sc_y = y / tile_size / 32 % sh;
+        let tile_x = x / tile_size % 32;
+        let tile_y = y / tile_size % 32;
+
+        let sc_addr = base_addr + (sc_x + sc_y * sw) * SC_SIZE;
+        let entry_addr = (sc_addr + (tile_x + tile_y * 32) * 2) & 0xFFFE;
+
+        self.vram[entry_addr..entry_addr + 2].try_into().unwrap()
     }
 
     fn render_bg_mode7(&mut self, y: u32, z: u8) {
@@ -1285,7 +1484,7 @@ impl Ppu {
         let win_calc = self.win_calc_obj();
 
         let mut render_obj = 0;
-        let mut render_block = 0;
+        let mut render_tiles = 0;
 
         let priority_rot = if self.oam_addr.priority_rotation() {
             (self.oam_addr.addr() >> 1) & 0x7F
@@ -1300,8 +1499,25 @@ impl Ppu {
             let extra = (self.oam[0x200 + i / 4] >> ((i & 3) * 2)) & 3;
 
             let (ow, oh) = sizes[(extra >> 1) as usize];
+
+            let ox = ((extra as usize & 1) << 8) + entry.x() as usize;
             let oy = entry.y() as usize + 1;
-            if !(oy..oy + oh).contains(&y) {
+
+            let dy = if oy < 240 {
+                if (oy..oy + oh).contains(&y) {
+                    y - oy
+                } else {
+                    continue;
+                }
+            } else {
+                if (oy..oy + oh).contains(&(y + 256)) {
+                    y + 256 - oy
+                } else {
+                    continue;
+                }
+            };
+
+            if !(ox < 256 || (ox + ow) & 0x1FF < 256) {
                 continue;
             }
 
@@ -1311,8 +1527,6 @@ impl Ppu {
                 break;
             }
 
-            let ox = ((extra as usize & 1) << 8) + entry.x() as usize;
-            let dy = y - oy;
             let pixel_y = if !entry.y_flip() { dy } else { oh - 1 - dy };
 
             let z = OBJ_Z[entry.priority() as usize] * 0x10
@@ -1326,7 +1540,7 @@ impl Ppu {
             let tile_num = tile_num & 0x10F | ((tile_num & 0xF0) + pixel_y / 8 * 16) & 0xF0;
 
             for dx in 0..ow {
-                let x = ox + dx;
+                let x = (ox + dx) & 0x1FF;
                 if !(0..SCREEN_WIDTH as usize).contains(&x) {
                     continue;
                 }
@@ -1346,7 +1560,7 @@ impl Ppu {
 
                 let mut pixel = 0;
                 for i in 0..BPP / 2 {
-                    let addr = tile_addr + i * 16 + pixel_y % 8 * 2;
+                    let addr = (tile_addr + i * 16 + pixel_y % 8 * 2) & 0xFFFE;
                     let b0 = self.vram[addr];
                     let b1 = self.vram[addr + 1];
                     pixel |= ((b0 >> (7 - pixel_x % 8)) & 1) << (i * 2);
@@ -1366,8 +1580,9 @@ impl Ppu {
                 }
             }
 
-            render_block += ow / 8;
-            if render_block > 34 {
+            // FIXME: Only tiles that have actually been rendered
+            render_tiles += ow / 8;
+            if render_tiles > 34 {
                 self.obj_time_overflow = true;
                 break;
             }
