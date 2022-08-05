@@ -20,6 +20,11 @@ pub struct Dsp {
     noise: i16,
     noise_counter: u16,
 
+    echo_buf_index: u16,
+    echo_remain: u16,
+    fir_buf: [[i16; 2]; 8],
+    fir_index: usize,
+
     #[educe(Default(expression = "vec![0; 0x10000]"))]
     pub ram: Vec<u8>,
 
@@ -44,13 +49,15 @@ impl Default for Flags {
     }
 }
 
-#[derive(Default)]
+#[derive(Educe)]
+#[educe(Default)]
 struct Voice {
     key_on: bool,
     key_off: bool,
     enable_pitch_modulation: bool,
     enable_noise: bool,
     enable_echo: bool,
+    #[educe(Default = true)]
     voice_end: bool,
 
     volume: [i8; 2],
@@ -136,6 +143,7 @@ impl Voice {
 
         let mut prev_brr_ix = ((self.brr_pitch_counter >> 12) & 0xF) as usize;
         let (counter, ovf) = self.brr_pitch_counter.overflowing_add(step);
+        self.brr_pitch_counter = counter;
 
         if ovf {
             for i in prev_brr_ix + 1..16 {
@@ -150,8 +158,6 @@ impl Voice {
             self.push_hist(self.brr_buf[i]);
         }
 
-        self.brr_pitch_counter = counter;
-
         // BRR decode and check end flag are performed even if noise is enabled
         let sample = if !self.enable_noise {
             let interpol_ix = ((counter >> 4) & 0xFF) as usize;
@@ -160,8 +166,12 @@ impl Voice {
             noise
         };
 
-        // Calculate envelope
+        self.update_envelope();
 
+        self.cur_sample = ((sample as i32 * self.cur_envelope as i32) >> 11) as i16;
+    }
+
+    fn update_envelope(&mut self) {
         self.cur_envelope &= 0x7FF;
 
         if !matches!(self.state, EnvelopeState::Release) && !self.adsr_setting.use_adsr() {
@@ -249,8 +259,6 @@ impl Voice {
                 }
             }
         }
-
-        self.cur_sample = ((sample as i32 * self.cur_envelope as i32) >> 11) as i16;
     }
 
     fn brr_start(&mut self, ram: &[u8], addr: u16) {
@@ -296,14 +304,6 @@ impl Voice {
                 ((nibble >> 3) << 12) >> 1
             };
 
-            // FIXME: Filter overflow behavior
-            // glitches will occur:
-            // If new>+7FFFh then new=+7FFFh (but, clipped to +3FFFh below) ;\clamp 16bit
-            // If new<-8000h then new=-8000h (but, clipped to ZERO below)   ;/(dirt-effect)
-            // If new=(+4000h..+7FFFh) then new=(-4000h..-1)                ;\clip 15bit
-            // If new=(-8000h..-4001h) then new=(-0..-3FFFh)                ;/(lost-sign)
-            // If new>+3FF8h OR new<-3FFAh then overflows can occur in Gauss section
-
             let old = self.brr_old[0] as i32;
             let older = self.brr_old[1] as i32;
             let sample = sample as i32;
@@ -316,8 +316,11 @@ impl Voice {
                 _ => unreachable!(),
             };
 
-            // 15bit signed value
-            let new = ((new << 1) >> 1) as i16;
+            // Clamp 16bit
+            let new = new.clamp(-0x8000, 0x7FFF) as i16;
+
+            // Clip 15bit
+            let new = (new << 1) >> 1;
 
             self.brr_buf[i] = new;
             self.brr_old[1] = self.brr_old[0];
@@ -363,28 +366,74 @@ impl Dsp {
         }
 
         let mut output = [0; 2];
+        let mut echo_input = [0; 2];
+
+        let echo_addr =
+            (self.echo_buf_addr as usize * 0x100 + self.echo_buf_index as usize * 4) & 0xFFFC;
+
+        self.fir_buf[self.fir_index] = [
+            i16::from_le_bytes(self.ram[echo_addr..echo_addr + 2].try_into().unwrap()) >> 1,
+            i16::from_le_bytes(self.ram[echo_addr + 2..echo_addr + 4].try_into().unwrap()) >> 1,
+        ];
 
         for i in 0..2 {
-            let mut sum = 0;
+            let mut normal_voices = 0_i32;
+            let mut echo_voices = 0_i32;
 
             for ch in 0..8 {
                 let sample = ((self.voice[ch].cur_sample << 1) as i16 as i32) >> 1;
                 let c = (sample * self.voice[ch].volume[i] as i32) >> 6;
-                sum = (sum + c).clamp(-0x8000, 0x7FFF);
+                normal_voices = (normal_voices + c).clamp(-0x8000, 0x7FFF);
+                if self.voice[ch].enable_echo {
+                    echo_voices = (echo_voices + c).clamp(-0x8000, 0x7FFF);
+                }
             }
 
-            sum = (sum * self.master_volume[i] as i32) >> 7;
+            normal_voices =
+                ((normal_voices * self.master_volume[i] as i32) >> 7).clamp(-0x8000, 0x7FFF);
 
-            // TODO: sum = sum + (fir_out*EVOLx SAR 7)
+            let mut fir_out = 0_i16;
 
-            if self.flags.mute() {
-                sum = 0;
+            for ofs in 0..8 {
+                let f = self.fir_buf[(self.fir_index + 1 + ofs) & 7][i];
+                let f = (f as i32 * self.voice[ofs].fir_coeff as i32) >> 6;
+                if ofs == 7 {
+                    fir_out = fir_out.saturating_add(f as i16);
+                } else {
+                    fir_out = fir_out.wrapping_add(f as i16);
+                }
             }
 
-            // FIXME: ???
-            // sum = sum XOR FFFFh  ;-final phase inversion (as done by built-in post-amp)
+            let audio_output = (normal_voices
+                + ((fir_out as i32 * self.echo_volume[i] as i32) >> 7))
+                .clamp(-0x8000, 0x7FFF) as i16;
 
-            output[i] = sum as i16;
+            echo_input[i] = ((echo_voices + ((fir_out as i32 * self.echo_feedback as i32) >> 7))
+                .clamp(-0x8000, 0x7FFF)
+                & 0xFFFE) as i16;
+
+            output[i] = if self.flags.mute() { 0 } else { audio_output };
+
+            // Phase inversion (?)
+            output[i] = !output[i]
+        }
+
+        if !self.flags.disable_echo_buf_write() {
+            self.ram[echo_addr..echo_addr + 2].copy_from_slice(&i16::to_le_bytes(echo_input[0]));
+            self.ram[echo_addr + 2..echo_addr + 4]
+                .copy_from_slice(&i16::to_le_bytes(echo_input[1]));
+        }
+
+        self.fir_index = (self.fir_index + 1) & 7;
+        self.echo_buf_index = self.echo_buf_index.wrapping_add(1);
+
+        self.echo_remain = self.echo_remain.saturating_sub(4);
+        if self.echo_remain == 0 {
+            self.echo_remain = match self.echo_buf_size & 0xF {
+                0 => 4,
+                n => (n as u16) << 11,
+            };
+            self.echo_buf_index = 0;
         }
 
         let output = AudioSample {
