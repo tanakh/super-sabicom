@@ -98,7 +98,7 @@ impl Dma {
 }
 
 #[bitfield(bits = 8)]
-#[derive(Default)]
+#[derive(Default, Debug)]
 struct DmaParam {
     transfer_unit: B3,
     abus_addr_step: DmaAddrStep,
@@ -110,7 +110,7 @@ struct DmaParam {
 
 #[derive(BitfieldSpecifier)]
 #[bits = 2]
-#[derive(Default)]
+#[derive(Default, Debug)]
 enum DmaAddrStep {
     #[default]
     Increment = 0,
@@ -119,7 +119,7 @@ enum DmaAddrStep {
     Fixed2 = 3, // same as Fixed
 }
 
-#[derive(BitfieldSpecifier)]
+#[derive(BitfieldSpecifier, Debug)]
 #[bits = 1]
 #[derive(Default)]
 enum DmaAddrMode {
@@ -130,7 +130,7 @@ enum DmaAddrMode {
 
 #[derive(BitfieldSpecifier)]
 #[bits = 1]
-#[derive(Default)]
+#[derive(Default, Debug)]
 enum DmaTransferDir {
     #[default]
     CpuToIo = 0,
@@ -786,7 +786,11 @@ impl Bus {
     }
 
     fn hdma_reload(&mut self, ctx: &mut impl Context, ch: usize) {
-        info!("HDMA Init: {ch}");
+        info!("HDMA{ch} Init: param = {:?}", self.dma[ch].param);
+
+        // HDMA cancels same channel' GDMA
+        self.dma[ch].gdma_do_transfer = false;
+        self.gdma_enable &= !(1 << ch);
 
         self.locked = true;
 
@@ -805,6 +809,10 @@ impl Bus {
         if matches!(self.dma[ch].param.addr_mode(), DmaAddrMode::Indirect) {
             let addr = self.dma[ch].hdma_addr(2);
             self.dma[ch].byte_count_or_indirect_hdma_addr = self.read16::<_, true>(ctx, addr);
+            info!(
+                "HDMA{ch}: Indirect addr = {:04X}",
+                self.dma[ch].byte_count_or_indirect_hdma_addr
+            );
             ctx.elapse(16);
         }
 
@@ -817,9 +825,9 @@ impl Bus {
     }
 
     fn hdma_exec(&mut self, ctx: &mut impl Context, ch: usize) {
-        if matches!(self.dma[ch].param.transfer_dir(), DmaTransferDir::IoToCpu) {
-            todo!("IO to CPU HDMA");
-        }
+        // HDMA cancels same channel' GDMA
+        self.dma[ch].gdma_do_transfer = false;
+        self.gdma_enable &= !(1 << ch);
 
         // ctx.elapse(8);
 
@@ -829,17 +837,23 @@ impl Bus {
             info!("HDMA {ch}: Do trans {} bytes", transfer_unit.len());
 
             for i in 0..transfer_unit.len() {
-                let src_addr = match self.dma[ch].param.addr_mode() {
+                let cpu_addr = match self.dma[ch].param.addr_mode() {
                     DmaAddrMode::Direct => self.dma[ch].hdma_addr(1),
                     DmaAddrMode::Indirect => self.dma[ch].hdma_indirect_addr(1),
                 };
-                let dst_addr =
+                let io_addr =
                     0x2100 | self.dma[ch].iobus_addr.wrapping_add(transfer_unit[i] as u8) as u32;
 
-                info!("HDMA: {src_addr:06X} -> {dst_addr:04X}");
+                if matches!(self.dma[ch].param.transfer_dir(), DmaTransferDir::CpuToIo) {
+                    info!("HDMA: {cpu_addr:06X} -> {io_addr:04X}");
+                    let data = self.read::<_, true>(ctx, cpu_addr);
+                    self.write::<_, true>(ctx, io_addr, data);
+                } else {
+                    info!("HDMA: {io_addr:06X} -> {cpu_addr:04X}");
+                    let data = self.read::<_, true>(ctx, io_addr);
+                    self.write::<_, true>(ctx, cpu_addr, data);
+                }
 
-                let data = self.read::<_, true>(ctx, src_addr);
-                self.write::<_, true>(ctx, dst_addr, data);
                 ctx.elapse(8);
                 self.locked = true;
             }
