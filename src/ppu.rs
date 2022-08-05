@@ -1,7 +1,7 @@
 #![allow(unused_braces)]
 
 use educe::Educe;
-use log::{debug, warn};
+use log::{debug, info, warn};
 use meru_interface::{FrameBuffer, Pixel};
 use modular_bitfield::prelude::*;
 
@@ -84,10 +84,10 @@ pub struct Ppu {
     line_buffer_main: Vec<u16>,
     #[educe(Default(expression = "vec![0; SCREEN_WIDTH.try_into().unwrap()]"))]
     line_buffer_sub: Vec<u16>,
-    #[educe(Default(expression = "vec![0; SCREEN_WIDTH.try_into().unwrap()]"))]
-    z_buffer_main: Vec<u8>,
-    #[educe(Default(expression = "vec![0; SCREEN_WIDTH.try_into().unwrap()]"))]
-    z_buffer_sub: Vec<u8>,
+    #[educe(Default(expression = "vec![Default::default(); SCREEN_WIDTH.try_into().unwrap()]"))]
+    attr_buffer_main: Vec<PixelAttr>,
+    #[educe(Default(expression = "vec![Default::default(); SCREEN_WIDTH.try_into().unwrap()]"))]
+    attr_buffer_sub: Vec<PixelAttr>,
 }
 
 #[bitfield(bits = 16)]
@@ -498,7 +498,7 @@ impl Ppu {
                 if self.y >= lines_per_frame {
                     self.y = 0;
                     self.frame += 1;
-                    debug!("Start Frame: {}", self.frame);
+                    info!("Start Frame: {}", self.frame);
 
                     // End of VBlank
                     self.vblank = false;
@@ -509,6 +509,7 @@ impl Ppu {
                 debug!("Line: {}:{}", self.frame, self.y);
 
                 if self.y == VBLANK_START {
+                    info!("VBlank Start");
                     self.vblank = true;
                 }
             }
@@ -1034,6 +1035,23 @@ impl Ppu {
     }
 }
 
+#[bitfield(bits = 8)]
+#[derive(Clone)]
+struct PixelAttr {
+    kind: B3,
+    sprite: bool,
+    z: B4,
+}
+
+impl Default for PixelAttr {
+    fn default() -> Self {
+        PixelAttr::new()
+            .with_z(0xF)
+            .with_sprite(false)
+            .with_kind(PIXEL_KIND_BACKDROP)
+    }
+}
+
 const PIXEL_KIND_BG1: u8 = 0;
 const PIXEL_KIND_BG2: u8 = 1;
 const PIXEL_KIND_BG3: u8 = 2;
@@ -1063,9 +1081,9 @@ impl Ppu {
 
         // Backdrop
         self.line_buffer_main.fill(self.cgram[0]);
-        self.z_buffer_main.fill(0xF0 | PIXEL_KIND_BACKDROP);
+        self.attr_buffer_main.fill(PixelAttr::default());
         self.line_buffer_sub.fill(self.sub_backdrop.into());
-        self.z_buffer_sub.fill(0xF0 | PIXEL_KIND_BACKDROP);
+        self.attr_buffer_sub.fill(PixelAttr::default());
 
         //     Mode0    Mode1    Mode2    Mode3    Mode4    Mode5    Mode6    Mode7
         // 0:  -        BG3.1a   -        -        -        -        -        -
@@ -1100,8 +1118,8 @@ impl Ppu {
                 }
             }
             2 => {
-                self.render_bg(y, 0, 4, 11, 5, 0x00);
-                self.render_bg(y, 1, 4, 8, 2, 0x00);
+                self.render_bg(y, 0, 4, 8, 2, 0x00);
+                self.render_bg(y, 1, 4, 11, 5, 0x00);
             }
             3 => {
                 self.render_bg(y, 0, 8, 8, 2, 0x00);
@@ -1160,7 +1178,13 @@ impl Ppu {
             return;
         }
 
+        if bpp == 8 && self.color_math_ctrl.direct_color() {
+            todo!("Direct color in 256 color BG");
+        }
+
         let win_calc = self.win_calc_bg(i);
+        let win_disable_main = self.win_disable_main.bg(i);
+        let win_disable_sub = self.win_disable_sub.bg(i);
 
         let offset_per_tile = match self.bg_mode.mode() {
             2 | 4 | 6 => true,
@@ -1216,8 +1240,8 @@ impl Ppu {
         // FIXME: optimize
         for x in 0..SCREEN_WIDTH {
             let in_win = win_calc.contains(x);
-            let render_main = enable_main && !in_win;
-            let render_sub = enable_sub && !in_win;
+            let render_main = enable_main && !(win_disable_main && in_win);
+            let render_sub = enable_sub && !(win_disable_sub && in_win);
             if !render_main && !render_sub {
                 continue;
             }
@@ -1301,7 +1325,7 @@ impl Ppu {
             let pixel_x = (sx % TILE_SIZE) ^ if !entry.x_flip() { 0 } else { TILE_SIZE - 1 };
             let pixel_y = (sy % TILE_SIZE) ^ if !entry.y_flip() { 0 } else { TILE_SIZE - 1 };
 
-            let z = if entry.priority() == 0 { zl } else { zh } * 0x10 + pixel_kind;
+            let z = if entry.priority() == 0 { zl } else { zh };
 
             let char_num = (entry.char_num() as usize + pixel_x / 8 + pixel_y / 8 * 0x10) & 0x3FF;
             let pixel_x = pixel_x % 8;
@@ -1320,13 +1344,15 @@ impl Ppu {
 
             if pixel != 0 {
                 let col = self.cgram[(pal_base + entry.pal_num() * pal_size + pixel) as usize];
-                if render_main && z < self.z_buffer_main[x as usize] {
+                if render_main && z < self.attr_buffer_main[x as usize].z() {
                     self.line_buffer_main[x as usize] = col;
-                    self.z_buffer_main[x as usize] = z;
+                    self.attr_buffer_main[x as usize].set_z(z);
+                    self.attr_buffer_main[x as usize].set_kind(pixel_kind);
                 }
-                if render_sub && z < self.z_buffer_sub[x as usize] {
+                if render_sub && z < self.attr_buffer_sub[x as usize].z() {
                     self.line_buffer_sub[x as usize] = col;
-                    self.z_buffer_sub[x as usize] = z;
+                    self.attr_buffer_sub[x as usize].set_z(z);
+                    self.attr_buffer_sub[x as usize].set_kind(pixel_kind);
                 }
             }
         }
@@ -1366,8 +1392,8 @@ impl Ppu {
             return;
         }
         let win_calc = self.win_calc_bg(0);
-
-        let z = z * 0x10 + PIXEL_KIND_BG1;
+        let win_disable_main = self.win_disable_main.bg(0);
+        let win_disable_sub = self.win_disable_sub.bg(0);
 
         let x_flip = if self.rot_setting.h_flip() { 0xFF } else { 0 };
         let y_flip = if self.rot_setting.v_flip() { 0xFF } else { 0 };
@@ -1414,8 +1440,8 @@ impl Ppu {
             let vy = ly + dy * (x as i32);
 
             let in_win = win_calc.contains(x);
-            let render_main = enable_main && !in_win;
-            let render_sub = enable_sub && !in_win;
+            let render_main = enable_main && !(win_disable_main && in_win);
+            let render_sub = enable_sub && !(win_disable_sub && in_win);
             if !render_main && !render_sub {
                 continue;
             }
@@ -1446,13 +1472,15 @@ impl Ppu {
 
             if pixel != 0 {
                 let col = self.cgram[pixel as usize];
-                if render_main && z < self.z_buffer_main[x as usize] {
+                if render_main && z < self.attr_buffer_main[x as usize].z() {
                     self.line_buffer_main[x as usize] = col;
-                    self.z_buffer_main[x as usize] = z;
+                    self.attr_buffer_main[x as usize].set_z(z);
+                    self.attr_buffer_main[x as usize].set_kind(PIXEL_KIND_BG1);
                 }
-                if render_sub && z < self.z_buffer_sub[x as usize] {
+                if render_sub && z < self.attr_buffer_sub[x as usize].z() {
                     self.line_buffer_sub[x as usize] = col;
-                    self.z_buffer_sub[x as usize] = z;
+                    self.attr_buffer_sub[x as usize].set_z(z);
+                    self.attr_buffer_sub[x as usize].set_kind(PIXEL_KIND_BG1);
                 }
             }
         }
@@ -1482,12 +1510,14 @@ impl Ppu {
         ];
 
         let win_calc = self.win_calc_obj();
+        let win_disable_main = self.win_disable_main.obj();
+        let win_disable_sub = self.win_disable_sub.obj();
 
         let mut render_obj = 0;
         let mut render_tiles = 0;
 
         let priority_rot = if self.oam_addr.priority_rotation() {
-            (self.oam_addr.addr() >> 1) & 0x7F
+            (self.oam_addr_internal >> 2) & 0x7F
         } else {
             0
         };
@@ -1529,12 +1559,12 @@ impl Ppu {
 
             let pixel_y = if !entry.y_flip() { dy } else { oh - 1 - dy };
 
-            let z = OBJ_Z[entry.priority() as usize] * 0x10
-                + if entry.pal_num() < 4 {
-                    PIXEL_KIND_OBJ_LOPAL
-                } else {
-                    PIXEL_KIND_OBJ_HIPAL
-                };
+            let z = OBJ_Z[entry.priority() as usize];
+            let pixel_kind = if entry.pal_num() < 4 {
+                PIXEL_KIND_OBJ_LOPAL
+            } else {
+                PIXEL_KIND_OBJ_HIPAL
+            };
 
             let tile_num = entry.tile_num() as usize;
             let tile_num = tile_num & 0x10F | ((tile_num & 0xF0) + pixel_y / 8 * 16) & 0xF0;
@@ -1546,8 +1576,8 @@ impl Ppu {
                 }
 
                 let in_win = win_calc.contains(x as u32);
-                let render_main = enable_main && !in_win;
-                let render_sub = enable_sub && !in_win;
+                let render_main = enable_main && !(win_disable_main && in_win);
+                let render_sub = enable_sub && !(win_disable_sub && in_win);
                 if !render_main && !render_sub {
                     continue;
                 }
@@ -1569,13 +1599,21 @@ impl Ppu {
 
                 if pixel != 0 {
                     let col = self.cgram[(0x80 + entry.pal_num() * PAL_SIZE + pixel) as usize];
-                    if render_main && z & 0xF0 < self.z_buffer_main[x as usize] & 0xF0 {
-                        self.line_buffer_main[x as usize] = col;
-                        self.z_buffer_main[x as usize] = z;
+                    if render_main && !self.attr_buffer_main[x as usize].sprite() {
+                        self.attr_buffer_main[x as usize].set_sprite(true);
+                        if z < self.attr_buffer_main[x as usize].z() {
+                            self.line_buffer_main[x as usize] = col;
+                            self.attr_buffer_main[x as usize].set_z(z);
+                            self.attr_buffer_main[x as usize].set_kind(pixel_kind);
+                        }
                     }
-                    if render_sub && z & 0xF0 < self.z_buffer_sub[x as usize] & 0xF0 {
-                        self.line_buffer_sub[x as usize] = col;
-                        self.z_buffer_sub[x as usize] = z;
+                    if render_sub && !self.attr_buffer_sub[x as usize].sprite() {
+                        self.attr_buffer_sub[x as usize].set_sprite(true);
+                        if z < self.attr_buffer_sub[x as usize].z() {
+                            self.line_buffer_sub[x as usize] = col;
+                            self.attr_buffer_sub[x as usize].set_z(z);
+                            self.attr_buffer_sub[x as usize].set_kind(pixel_kind);
+                        }
                     }
                 }
             }
@@ -1625,19 +1663,23 @@ impl Ppu {
             let enable = if !enable {
                 false
             } else {
-                let pixel_kind = self.z_buffer_main[x as usize] & 0xF;
+                let pixel_kind = self.attr_buffer_main[x as usize].kind();
                 self.color_math_ctrl.color_math_enable_kind() & (1 << pixel_kind) != 0
             };
 
+            let half_color = !force_main_black
+                && self.attr_buffer_sub[x as usize].kind() != PIXEL_KIND_BACKDROP
+                && self.color_math_ctrl.color_math_half();
+
             let result = if enable {
                 if self.color_math_ctrl.color_math_subtract() {
-                    if self.color_math_ctrl.color_math_half() {
+                    if half_color {
                         main.blend::<false, true>(sub)
                     } else {
                         main.blend::<false, false>(sub)
                     }
                 } else {
-                    if self.color_math_ctrl.color_math_half() {
+                    if half_color {
                         main.blend::<true, true>(sub)
                     } else {
                         main.blend::<true, false>(sub)
