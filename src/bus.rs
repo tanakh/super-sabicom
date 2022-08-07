@@ -426,17 +426,19 @@ impl Bus {
             // CPU On-Chip I/O Ports
             // JOYA - Joypad Input Register A (R)
             0x4016 => {
-                let b0 = self.controller_read(0, 4);
-                let b1 = self.controller_read(0, 5);
+                info!("Read JOYA");
+                let b0 = !self.controller_read(0, 4);
+                let b1 = !self.controller_read(0, 5);
                 self.controller_write(0, 2, true);
                 self.controller_write(0, 2, false);
                 b0 as u8 | (b1 as u8) << 1
             }
             // JOYB - Joypad Input Register B (R)
             0x4017 => {
+                info!("Read JOYB");
                 // FIXME: Manual read from joy pad and strobe
-                let b0 = self.controller_read(1, 4);
-                let b1 = self.controller_read(1, 5);
+                let b0 = !self.controller_read(1, 4);
+                let b1 = !self.controller_read(1, 5);
                 self.controller_write(1, 2, true);
                 self.controller_write(1, 2, false);
                 b0 as u8 | (b1 as u8) << 1 | 0x1C
@@ -471,6 +473,7 @@ impl Bus {
 
             // RDIO    - Joypad Programmable I/O Port (Input)
             0x4213 => {
+                info!("Read RDIO");
                 let b6 = self.controller_read(0, 6);
                 let b7 = self.controller_read(1, 6);
                 (b6 as u8) << 6 | (b7 as u8) << 7
@@ -486,6 +489,7 @@ impl Bus {
             0x4218..=0x421F => {
                 let i = (addr - 0x4218) as usize / 2;
                 let h = (addr - 0x4218) as usize % 2;
+                info!("JOY{i}{}", if h == 0 { 'L' } else { 'H' });
                 (self.controller_port[i % 2].pad_data[i / 2] >> (8 * h)) as u8
             }
 
@@ -501,7 +505,7 @@ impl Bus {
             ),
         };
 
-        debug!(
+        trace!(
             "IO Read: {addr:#06X}{} = {data:#04X}",
             ioreg_info(addr).map_or_else(|| "".to_string(), |info| format!("({})", info.name))
         );
@@ -509,7 +513,7 @@ impl Bus {
     }
 
     fn io_write(&mut self, ctx: &mut impl Context, addr: u16, data: u8) {
-        debug!(
+        trace!(
             "IO Write: {addr:#06X}{} = {data:#04X}",
             ioreg_info(addr).map_or_else(|| "".to_string(), |info| format!("({})", info.name))
         );
@@ -517,7 +521,7 @@ impl Bus {
         match addr {
             0x2100..=0x213F => ctx.ppu_write(addr, data),
             0x2140..=0x217F => {
-                log::debug!("SPC PORT[{}] = {data:02X} @ {}", addr & 3, ctx.now());
+                debug!("SPC PORT[{}] = {data:02X} @ {}", addr & 3, ctx.now());
                 ctx.spc_mut().write_port((addr & 3) as _, data);
             }
 
@@ -533,6 +537,7 @@ impl Bus {
 
             // CPU On-Chip I/O Ports
             0x4016 => {
+                info!("WRITE JOYWR: {data:02X}");
                 if data & 1 != 0 {
                     self.controller_write(0, 3, true);
                     self.controller_write(1, 3, true);
@@ -545,7 +550,7 @@ impl Bus {
                 let interrupt = ctx.interrupt_mut();
                 interrupt.set_nmi_enable(self.interrupt_enable.vblank_nmi_enable());
                 interrupt.set_hvirq_enable(self.interrupt_enable.hvirq_enable());
-                log::debug!("NMITIMEN = {:?}", self.interrupt_enable);
+                debug!("NMITIMEN = {:?}", self.interrupt_enable);
             }
             0x4201 => {
                 self.controller_port[0].enable = data & (1 << 6) != 0;
@@ -554,7 +559,6 @@ impl Bus {
             0x4202 => self.mul_a = data,
             0x4203 => {
                 self.mul_b = data;
-                // info!("Start mul: {:#04X}x{:#04X}", self.mul_a, self.mul_b);
                 // FIXME: Delay 8 cycles
                 // FIXME: Write during mul should clear intermediate result
                 self.div_rem_or_mul = self.mul_a as u16 * self.mul_b as u16;
@@ -564,7 +568,6 @@ impl Bus {
             0x4205 => self.div_a = self.div_a & 0x00FF | ((data as u16) << 8),
             0x4206 => {
                 self.div_b = data;
-                // info!("Start div: {:#06X}/{:#04X}", self.div_a, self.div_b);
                 // FIXME: Delay 16 cycles
                 if self.div_b != 0 {
                     self.div_quot = self.div_a / self.div_b as u16;
@@ -633,14 +636,8 @@ impl Bus {
         match cmd {
             0 => self.dma[ch].param.bytes[0] = data,
             1 => self.dma[ch].iobus_addr = data,
-            2 => {
-                self.dma[ch].cur_addr = self.dma[ch].cur_addr & 0xFF00 | data as u16;
-                self.dma[ch].hdma_cur_addr = self.dma[ch].cur_addr;
-            }
-            3 => {
-                self.dma[ch].cur_addr = self.dma[ch].cur_addr & 0x00FF | ((data as u16) << 8);
-                self.dma[ch].hdma_cur_addr = self.dma[ch].cur_addr;
-            }
+            2 => self.dma[ch].cur_addr = self.dma[ch].cur_addr & 0xFF00 | data as u16,
+            3 => self.dma[ch].cur_addr = self.dma[ch].cur_addr & 0x00FF | ((data as u16) << 8),
             4 => self.dma[ch].cur_bank = data,
             5 => {
                 self.dma[ch].byte_count_or_indirect_hdma_addr =
@@ -678,6 +675,8 @@ impl Bus {
                 ctx.elapse(18);
             }
 
+            // FIXME: Set do_transfer = true if any HDMA are enabled
+
             for ch in 0..8 {
                 if self.hdma_enable & (1 << ch) != 0 {
                     self.hdma_reload(ctx, ch);
@@ -700,7 +699,7 @@ impl Bus {
         if self.gdma_enable != 0 {
             if !self.gdma_do_transfer {
                 // Wait 2~8 master cycle to adjust master cycle to multiple of 8
-                ctx.elapse(8 - ctx.now() & 7);
+                ctx.elapse(8 - (ctx.now() & 7));
                 self.gdma_do_transfer = true;
             }
 
@@ -786,7 +785,7 @@ impl Bus {
     }
 
     fn hdma_reload(&mut self, ctx: &mut impl Context, ch: usize) {
-        info!("HDMA{ch} Init: param = {:?}", self.dma[ch].param);
+        debug!("HDMA{ch} Init: param = {:?}", self.dma[ch].param);
 
         // HDMA cancels same channel' GDMA
         self.dma[ch].gdma_do_transfer = false;
@@ -809,7 +808,7 @@ impl Bus {
         if matches!(self.dma[ch].param.addr_mode(), DmaAddrMode::Indirect) {
             let addr = self.dma[ch].hdma_addr(2);
             self.dma[ch].byte_count_or_indirect_hdma_addr = self.read16::<_, true>(ctx, addr);
-            info!(
+            debug!(
                 "HDMA{ch}: Indirect addr = {:04X}",
                 self.dma[ch].byte_count_or_indirect_hdma_addr
             );
@@ -818,13 +817,19 @@ impl Bus {
 
         self.dma[ch].hdma_do_transfer = true;
 
-        info!(
+        debug!(
             "HDMA {ch} Reload: Line counter: {:02X}, addr: {:04X} -> 21{:02X}",
             self.dma[ch].hdma_line_counter, self.dma[ch].hdma_cur_addr, self.dma[ch].iobus_addr,
         );
     }
 
     fn hdma_exec(&mut self, ctx: &mut impl Context, ch: usize) {
+        debug!(
+            "HDMA {ch}: Begin exec at line {}:{}",
+            ctx.counter().y,
+            ctx.counter().x
+        );
+
         // HDMA cancels same channel' GDMA
         self.dma[ch].gdma_do_transfer = false;
         self.gdma_enable &= !(1 << ch);
@@ -834,7 +839,7 @@ impl Bus {
         if self.dma[ch].hdma_do_transfer {
             let transfer_unit = self.dma[ch].transfer_unit();
 
-            info!("HDMA {ch}: Do trans {} bytes", transfer_unit.len());
+            debug!("HDMA {ch}: Do trans {} bytes", transfer_unit.len());
 
             for i in 0..transfer_unit.len() {
                 let cpu_addr = match self.dma[ch].param.addr_mode() {
@@ -845,13 +850,13 @@ impl Bus {
                     0x2100 | self.dma[ch].iobus_addr.wrapping_add(transfer_unit[i] as u8) as u32;
 
                 if matches!(self.dma[ch].param.transfer_dir(), DmaTransferDir::CpuToIo) {
-                    info!("HDMA: {cpu_addr:06X} -> {io_addr:04X}");
                     let data = self.read::<_, true>(ctx, cpu_addr);
                     self.write::<_, true>(ctx, io_addr, data);
+                    debug!("HDMA: {cpu_addr:06X} -> {io_addr:04X} = {data:02X}");
                 } else {
-                    info!("HDMA: {io_addr:06X} -> {cpu_addr:04X}");
                     let data = self.read::<_, true>(ctx, io_addr);
                     self.write::<_, true>(ctx, cpu_addr, data);
+                    debug!("HDMA: {io_addr:06X} -> {cpu_addr:04X} = {data:02X}");
                 }
 
                 ctx.elapse(8);
@@ -862,10 +867,12 @@ impl Bus {
         self.dma[ch].hdma_line_counter -= 1;
         self.dma[ch].hdma_do_transfer = self.dma[ch].hdma_line_counter & 0x80 != 0;
 
-        info!(
+        debug!(
             "HDMA {ch}: Line counter: {:02X}, Do transfer: {}",
             self.dma[ch].hdma_line_counter, self.dma[ch].hdma_do_transfer
         );
+
+        // FIXME: read one byte unless line counter != 0
 
         if self.dma[ch].hdma_line_counter & 0x7F == 0 {
             let addr = self.dma[ch].hdma_addr(1);
@@ -874,7 +881,7 @@ impl Bus {
             self.dma[ch].hdma_line_counter = data;
             self.locked = true;
 
-            info!(
+            debug!(
                 "HDMA {ch}: New line counter: {:02X}",
                 self.dma[ch].hdma_line_counter
             );
@@ -896,25 +903,28 @@ impl Bus {
 
             if self.dma[ch].hdma_line_counter == 0 {
                 self.dma[ch].hdma_done_transfer = true;
-                info!("HDMA {ch}: Done");
+                debug!("HDMA {ch}: Done");
             }
 
             self.dma[ch].hdma_do_transfer = true;
         }
+
+        debug!(
+            "HDMA {ch}: End exec, Do transfer: {}",
+            self.dma[ch].hdma_do_transfer
+        );
     }
 
     fn controller_read(&mut self, port: usize, pin: usize) -> bool {
-        if !self.controller_port[port].enable {
+        let controller = &self.controller_port[port];
+
+        if !controller.enable {
             return false;
         }
 
         match pin {
-            4 => {
-                self.controller_port[port].pad_data[0] & (1 << self.controller_port[port].pos) != 0
-            }
-            5 => {
-                self.controller_port[port].pad_data[1] & (1 << self.controller_port[port].pos) != 0
-            }
+            4 => controller.pos < 16 && controller.pad_data[0] & (1 << controller.pos) != 0,
+            5 => controller.pos < 16 && controller.pad_data[1] & (1 << controller.pos) != 0,
             6 => {
                 // FIXME
                 warn!("Read controller port {port}, pin {pin}");
