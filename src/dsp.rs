@@ -1,5 +1,5 @@
 use educe::Educe;
-use log::trace;
+use log::{debug, trace};
 use meru_interface::{AudioBuffer, AudioSample};
 use modular_bitfield::prelude::*;
 
@@ -15,6 +15,7 @@ pub struct Dsp {
     echo_buf_size: u8,
     na: u8,
 
+    #[educe(Default(expression = "[0, 1, 2, 3, 4, 5, 6, 7].map(Voice::new)"))]
     voice: [Voice; 8],
     #[educe(Default = 1)]
     noise: i16,
@@ -52,6 +53,7 @@ impl Default for Flags {
 #[derive(Educe)]
 #[educe(Default)]
 struct Voice {
+    ch: usize,
     key_on: bool,
     key_off: bool,
     enable_pitch_modulation: bool,
@@ -73,13 +75,21 @@ struct Voice {
 
     state: EnvelopeState,
     brr_cur_addr: u16,
-    brr_loop_addr: u16,
     brr_pitch_counter: u16,
     brr_cur_header: BrrBlockHeader,
     brr_buf: [i16; 16],
     brr_old: [i16; 2],
     gauss_old: [i16; 4],
     envelope_counter: u16,
+}
+
+impl Voice {
+    fn new(ch: usize) -> Voice {
+        Voice {
+            ch,
+            ..Default::default()
+        }
+    }
 }
 
 #[derive(Default)]
@@ -101,7 +111,7 @@ struct BrrBlockHeader {
 }
 
 #[bitfield(bits = 16)]
-#[derive(Default)]
+#[derive(Default, Debug)]
 struct AdsrSetting {
     attack_rate: B4, // Rate=N*2+1, Step=+32 (or Step=+1024 when Rate=31)
     decay_rate: B3,  // Rate=N*2+16, Step=-(((Level-1) SAR 8)+1)
@@ -119,13 +129,10 @@ impl Voice {
     fn tick(&mut self, ram: &[u8], sample_table_addr: u8, prev_out: Option<i16>, noise: i16) {
         if self.key_on {
             self.key_on = false;
-
             self.cur_envelope = 0;
             self.envelope_counter = 0;
             self.state = EnvelopeState::Attack;
-
-            let brr_addr = sample_table_addr as u16 * 0x100 + self.source_num as u16 * 4;
-            self.brr_start(ram, brr_addr);
+            self.brr_start(ram, sample_table_addr, false);
         }
 
         if self.key_off {
@@ -149,7 +156,7 @@ impl Voice {
             for i in prev_brr_ix + 1..16 {
                 self.push_hist(self.brr_buf[i]);
             }
-            self.brr_next(ram);
+            self.brr_next(ram, sample_table_addr);
             prev_brr_ix = 0;
         }
 
@@ -192,7 +199,7 @@ impl Voice {
                         0 => self.cur_envelope = self.cur_envelope.saturating_sub(32),
                         1 => {
                             if self.cur_envelope > 0 {
-                                let step = (self.cur_envelope - 1) >> 8 + 1;
+                                let step = ((self.cur_envelope - 1) >> 8) + 1;
                                 self.cur_envelope = self.cur_envelope.saturating_sub(step);
                             }
                         }
@@ -229,10 +236,10 @@ impl Voice {
                         self.envelope_counter = 0;
                         let step = ((self.cur_envelope - 1) >> 8) + 1;
                         self.cur_envelope -= step;
-                        let boundary = (self.adsr_setting.sustain_level() as u16 + 1) * 0x100;
-                        if self.cur_envelope <= boundary {
-                            self.state = EnvelopeState::Sustain;
-                        }
+                    }
+                    let boundary = (self.adsr_setting.sustain_level() as u16 + 1) * 0x100;
+                    if self.cur_envelope <= boundary {
+                        self.state = EnvelopeState::Sustain;
                     }
                 }
                 EnvelopeState::Sustain => {
@@ -261,41 +268,50 @@ impl Voice {
         }
     }
 
-    fn brr_start(&mut self, ram: &[u8], addr: u16) {
-        let addr = addr as usize;
-        self.brr_cur_addr = u16::from_le_bytes(ram[addr..addr + 2].try_into().unwrap());
-        self.brr_loop_addr = u16::from_le_bytes(ram[addr + 2..addr + 4].try_into().unwrap());
-        self.brr_pitch_counter = 0;
+    fn brr_start(&mut self, ram: &[u8], sample_table_addr: u8, repeat: bool) {
+        let addr = (sample_table_addr as u16 * 0x100 + self.source_num as u16 * 4) as usize;
+        self.brr_cur_addr = if !repeat {
+            u16::from_le_bytes(ram[addr..addr + 2].try_into().unwrap())
+        } else {
+            u16::from_le_bytes(ram[addr + 2..addr + 4].try_into().unwrap())
+        };
+        // self.brr_pitch_counter = 0;
+        debug!(
+            "Start BRR decode: entry = {addr:04X}, addr = {:04X}",
+            self.brr_cur_addr,
+        );
         self.brr_decode_block(ram);
     }
 
-    fn brr_next(&mut self, ram: &[u8]) {
+    fn brr_next(&mut self, ram: &[u8], sample_table_addr: u8) {
         if !self.brr_cur_header.end() {
             self.brr_decode_block(ram);
         } else if self.brr_cur_header.repeat() {
-            self.voice_end = true;
-            self.brr_cur_addr = self.brr_loop_addr;
-            // log::debug!("BRR repeat: addr = {:04X}", self.brr_cur_addr);
-            self.brr_decode_block(ram);
+            self.brr_start(ram, sample_table_addr, true);
         } else {
-            self.voice_end = true;
-            self.brr_cur_addr = self.brr_loop_addr;
             self.state = EnvelopeState::Release;
             self.cur_envelope = 0;
-            // log::debug!("BRR end: addr = {:04X}", self.brr_cur_addr);
-            self.brr_decode_block(ram);
+            self.brr_start(ram, sample_table_addr, true);
         }
     }
 
     fn brr_decode_block(&mut self, ram: &[u8]) {
-        let block = &ram[self.brr_cur_addr as usize..self.brr_cur_addr as usize + 9];
-        self.brr_cur_addr = self.brr_cur_addr.wrapping_add(9);
+        debug!("Decode BRR block: {:04X}", self.brr_cur_addr);
 
-        let header = BrrBlockHeader::from_bytes([block[0]]);
+        let header = BrrBlockHeader::from_bytes([ram[self.brr_cur_addr as usize]]);
+        self.brr_cur_addr = self.brr_cur_addr.wrapping_add(1);
+
+        if header.end() {
+            self.voice_end = true;
+        }
 
         for i in 0..16 {
-            let nibble = block[1 + i / 2] >> ((i & 1 ^ 1) * 4);
+            let nibble = ram[self.brr_cur_addr as usize] >> ((i & 1 ^ 1) * 4);
             let nibble = ((nibble as i16) << 12) >> 12;
+            if i & 1 == 1 {
+                self.brr_cur_addr = self.brr_cur_addr.wrapping_add(1);
+            }
+
             let shift = header.shift();
             let sample = if shift <= 12 {
                 (nibble << shift) >> 1
