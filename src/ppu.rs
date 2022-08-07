@@ -75,9 +75,6 @@ pub struct Ppu {
     bg_old: u8,
     m7_old: u8,
 
-    #[educe(Default(
-        expression = "FrameBuffer::new(SCREEN_WIDTH.try_into().unwrap(), SCREEN_HEIGHT.try_into().unwrap())"
-    ))]
     frame_buffer: FrameBuffer,
 
     #[educe(Default(expression = "vec![0; SCREEN_WIDTH.try_into().unwrap()]"))]
@@ -250,8 +247,29 @@ struct BgMode {
 }
 
 impl BgMode {
-    fn tile_size(&self, i: usize) -> bool {
-        self.tile_sizes() & (1 << i) != 0
+    fn tile_size(&self, bg: usize) -> (usize, usize) {
+        if !self.tile_sizes() & (1 << bg) != 0 {
+            match self.mode() {
+                5 | 6 => (16, 8),
+                _ => (8, 8),
+            }
+        } else {
+            (16, 16)
+        }
+    }
+
+    fn offset_per_tile(&self) -> bool {
+        match self.mode() {
+            2 | 4 | 6 => true,
+            _ => false,
+        }
+    }
+
+    fn hires(&self) -> bool {
+        match self.mode() {
+            5 | 6 => true,
+            _ => false,
+        }
     }
 }
 
@@ -369,7 +387,7 @@ impl WinLogic {
 
 #[derive(BitfieldSpecifier)]
 #[bits = 2]
-#[derive(Default, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy)]
 enum MaskLogic {
     #[default]
     Or = 0,
@@ -534,7 +552,6 @@ impl Ppu {
             if render && self.x == 22 {
                 if (1..1 + SCREEN_HEIGHT).contains(&self.y) {
                     self.render_line(self.y);
-                    self.copy_line_buffer(self.y - 1);
                 }
             }
 
@@ -921,6 +938,7 @@ struct ObjEntry {
     y_flip: bool,
 }
 
+#[derive(Debug)]
 struct WinCalc {
     enable: [bool; 2],
     outside: [bool; 2],
@@ -1074,8 +1092,19 @@ impl Ppu {
     }
 
     fn render_line(&mut self, y: u32) {
+        // FIXME: support overscan mode
+        if (self.frame_buffer.width, self.frame_buffer.height) != (512, 448) {
+            self.frame_buffer.resize(512, 448);
+        }
+
         if self.display_ctrl.force_blank() {
-            self.line_buffer_main.fill(0);
+            let fb_y = (self.y as usize - 1) * 2;
+            let black = Pixel::new(0, 0, 0);
+            for y in 0..2 {
+                for x in 0..self.frame_buffer.width {
+                    *self.frame_buffer.pixel_mut(x, fb_y + y) = black.clone();
+                }
+            }
             return;
         }
 
@@ -1130,8 +1159,8 @@ impl Ppu {
                 self.render_bg(y, 1, 2, 11, 5, 0x00);
             }
             5 => {
-                // TODO
-                todo!("BG Mode 5")
+                self.render_bg(y, 0, 4, 8, 2, 0x00);
+                self.render_bg(y, 1, 2, 11, 5, 0x00);
             }
             6 => {
                 // TODO
@@ -1148,30 +1177,7 @@ impl Ppu {
         self.color_math();
     }
 
-    fn copy_line_buffer(&mut self, y: u32) {
-        for x in 0..SCREEN_WIDTH {
-            *self.frame_buffer.pixel_mut(x as usize, y as usize) =
-                u16_to_pixel(self.line_buffer_main[x as usize]);
-        }
-    }
-
     fn render_bg(&mut self, y: u32, i: usize, bpp: usize, zl: u8, zh: u8, pal_base: u8) {
-        if !self.bg_mode.tile_size(i) {
-            self.render_bg_::<8>(y, i, bpp, zl, zh, pal_base);
-        } else {
-            self.render_bg_::<16>(y, i, bpp, zl, zh, pal_base);
-        }
-    }
-
-    fn render_bg_<const TILE_SIZE: usize>(
-        &mut self,
-        y: u32,
-        i: usize,
-        bpp: usize,
-        zl: u8,
-        zh: u8,
-        pal_base: u8,
-    ) {
         let enable_main = self.screen_desig_main.bg(i);
         let enable_sub = self.screen_desig_sub.bg(i);
         if !enable_main && !enable_sub {
@@ -1186,14 +1192,13 @@ impl Ppu {
         let win_disable_main = self.win_disable_main.bg(i);
         let win_disable_sub = self.win_disable_sub.bg(i);
 
-        let offset_per_tile = match self.bg_mode.mode() {
-            2 | 4 | 6 => true,
-            _ => false,
-        };
+        let bg_mode = self.bg_mode.mode();
 
-        // FIXME: base_addr is 6bit (0x3F * 2K = 126K), but VRAM is 64KB ???
-        let sc_base_addr = self.bg_sc[i].base_addr() as usize * 2 * 1024;
+        let offset_per_tile = self.bg_mode.offset_per_tile();
+        let hires = self.bg_mode.hires();
+
         let tile_base_addr = self.bg_tile_base_addr[i] as usize * 8 * 1024;
+        let (tile_w, tile_h) = self.bg_mode.tile_size(i);
 
         let hofs = (self.bg_hofs[i] & 0x3FF) as usize;
         let vofs = (self.bg_vofs[i] & 0x3FF) as usize;
@@ -1215,9 +1220,8 @@ impl Ppu {
 
         let sy = y as usize + vofs - mosaic_vofs as usize;
 
-        let pal_size = 1 << bpp;
-
-        let (sc_w, sc_h) = self.bg_sc[i].screen_size();
+        let pal_size = 1_usize << bpp;
+        let pal_base = pal_base as usize;
 
         let pixel_kind = match i {
             0 => PIXEL_KIND_BG1,
@@ -1230,15 +1234,16 @@ impl Ppu {
         let mut mosaic_hofs = 0;
 
         // For offset-per-tile mode
-        let first_tile = hofs / TILE_SIZE;
+        let first_tile = hofs / tile_w;
         let bg3_hofs = (self.bg_hofs[2] & 0x3FF) as usize;
         let bg3_vofs = (self.bg_vofs[2] & 0x3FF) as usize;
-        let (bg3_sc_w, bg3_sc_h) = self.bg_sc[2].screen_size();
-        let bg3_base_addr = self.bg_sc[2].base_addr() as usize * 2 * 1024;
-        let bg3_tile_size = if !self.bg_mode.tile_size(2) { 8 } else { 16 };
 
         // FIXME: optimize
-        for x in 0..SCREEN_WIDTH {
+
+        let screen_width = if !hires { 256 } else { 512 };
+        let hofs = if !hires { hofs } else { hofs * 2 };
+
+        for x in 0..screen_width {
             let in_win = win_calc.contains(x);
             let render_main = enable_main && !(win_disable_main && in_win);
             let render_sub = enable_sub && !(win_disable_sub && in_win);
@@ -1252,28 +1257,13 @@ impl Ppu {
                 mosaic_hofs = 0;
             }
 
-            let (sx, sy) = if offset_per_tile && first_tile != (sx / TILE_SIZE) {
-                if self.bg_mode.mode() == 2 {
+            let (sx, sy) = if offset_per_tile && first_tile != (sx / tile_w) {
+                if bg_mode == 2 {
+                    let bg3_x = ((x.wrapping_sub(8) & !7) + (bg3_hofs as u32 & !7)) as usize;
                     // Hval = GetTile(BG3, (HOFS&7)|(((X-8)&~7)+(BG3HOFS&~7)), BG3VOFS)
-                    let h_val = BgOptEntry::from_bytes(self.get_tile(
-                        2,
-                        ((x.wrapping_sub(8) & !7).wrapping_add(bg3_hofs as u32 & !7)) as usize,
-                        bg3_vofs,
-                        bg3_sc_w,
-                        bg3_sc_h,
-                        bg3_base_addr,
-                        bg3_tile_size,
-                    ));
+                    let h_val = BgOptEntry::from_bytes(self.get_tile(2, bg3_x, bg3_vofs));
                     // Vval = GetTile(BG3, (HOFS&7)|(((X-8)&~7)+(BG3HOFS&~7)), BG3VOFS + 8)
-                    let v_val = BgOptEntry::from_bytes(self.get_tile(
-                        2,
-                        ((x.wrapping_sub(8) & !7).wrapping_add(bg3_hofs as u32 & !7)) as usize,
-                        bg3_vofs + 8,
-                        bg3_sc_w,
-                        bg3_sc_h,
-                        bg3_base_addr,
-                        bg3_tile_size,
-                    ));
+                    let v_val = BgOptEntry::from_bytes(self.get_tile(2, bg3_x, bg3_vofs + 8));
                     // if(Hval&ValidBit) HOFS = (HOFS&7) | ((X&~7) + (Hval&~7))
                     let sx = if h_val.apply_to_bg(i) {
                         (sx & 7) | ((x & !7) + h_val.offset() as u32 & !7) as usize
@@ -1287,18 +1277,9 @@ impl Ppu {
                         sy
                     };
                     (sx, sy)
-                } else if self.bg_mode.mode() == 4 {
-                    let val = BgOptEntry::from_bytes(self.get_tile(
-                        2,
-                        (sx & 7)
-                            | ((x.wrapping_sub(8) & !7).wrapping_add(bg3_hofs as u32 & !7))
-                                as usize,
-                        bg3_vofs,
-                        bg3_sc_w,
-                        bg3_sc_h,
-                        bg3_base_addr,
-                        bg3_tile_size,
-                    ));
+                } else if bg_mode == 4 {
+                    let bg3_x = ((x.wrapping_sub(8) & !7) + (bg3_hofs as u32 & !7)) as usize;
+                    let val = BgOptEntry::from_bytes(self.get_tile(2, bg3_x, bg3_vofs));
                     // if(Hval&ValidBit) HOFS = (HOFS&7) | ((X&~7) + (Hval&~7))
                     let sx = if !val.apply_to_v() {
                         (sx & 7) | ((x & !7) + val.offset() as u32 & !7) as usize
@@ -1313,17 +1294,17 @@ impl Ppu {
                     };
                     (sx, sy)
                 } else {
-                    todo!()
+                    todo!("Mode 6")
                 }
             } else {
                 (sx, sy)
             };
 
-            let entry = self.get_tile(i, sx, sy, sc_w, sc_h, sc_base_addr, TILE_SIZE);
+            let entry = self.get_tile(i, sx, sy);
             let entry = BgMapEntry::from_bytes(entry);
 
-            let pixel_x = (sx % TILE_SIZE) ^ if !entry.x_flip() { 0 } else { TILE_SIZE - 1 };
-            let pixel_y = (sy % TILE_SIZE) ^ if !entry.y_flip() { 0 } else { TILE_SIZE - 1 };
+            let pixel_x = (sx % tile_w) ^ if !entry.x_flip() { 0 } else { tile_w - 1 };
+            let pixel_y = (sy % tile_h) ^ if !entry.y_flip() { 0 } else { tile_h - 1 };
 
             let z = if entry.priority() == 0 { zl } else { zh };
 
@@ -1343,39 +1324,57 @@ impl Ppu {
             }
 
             if pixel != 0 {
-                let col = self.cgram[(pal_base + entry.pal_num() * pal_size + pixel) as usize];
-                if render_main && z < self.attr_buffer_main[x as usize].z() {
-                    self.line_buffer_main[x as usize] = col;
-                    self.attr_buffer_main[x as usize].set_z(z);
-                    self.attr_buffer_main[x as usize].set_kind(pixel_kind);
-                }
-                if render_sub && z < self.attr_buffer_sub[x as usize].z() {
-                    self.line_buffer_sub[x as usize] = col;
-                    self.attr_buffer_sub[x as usize].set_z(z);
-                    self.attr_buffer_sub[x as usize].set_kind(pixel_kind);
+                let col = self.cgram
+                    [(pal_base + entry.pal_num() as usize * pal_size + pixel as usize) & 0xFF];
+
+                if !hires {
+                    let x = x as usize;
+                    if render_main && z < self.attr_buffer_main[x].z() {
+                        self.line_buffer_main[x] = col;
+                        self.attr_buffer_main[x].set_z(z);
+                        self.attr_buffer_main[x].set_kind(pixel_kind);
+                    }
+                    if render_sub && z < self.attr_buffer_sub[x].z() {
+                        self.line_buffer_sub[x] = col;
+                        self.attr_buffer_sub[x].set_z(z);
+                        self.attr_buffer_sub[x].set_kind(pixel_kind);
+                    }
+                } else {
+                    if x & 1 == 0 {
+                        let x = x as usize / 2;
+                        if render_sub && z < self.attr_buffer_sub[x].z() {
+                            self.line_buffer_sub[x] = col;
+                            self.attr_buffer_sub[x].set_z(z);
+                            self.attr_buffer_sub[x].set_kind(pixel_kind);
+                        }
+                    } else {
+                        let x = x as usize / 2;
+                        if render_main && z < self.attr_buffer_main[x].z() {
+                            self.line_buffer_main[x] = col;
+                            self.attr_buffer_main[x].set_z(z);
+                            self.attr_buffer_main[x].set_kind(pixel_kind);
+                        }
+                    }
                 }
             }
         }
     }
 
-    fn get_tile(
-        &self,
-        bg: usize,
-        x: usize,
-        y: usize,
-        sw: usize,
-        sh: usize,
-        base_addr: usize,
-        tile_size: usize,
-    ) -> [u8; 2] {
+    fn get_tile(&self, bg: usize, x: usize, y: usize) -> [u8; 2] {
         const SC_SIZE: usize = 32 * 32 * 2;
 
-        let sc_x = x / tile_size / 32 % sw;
-        let sc_y = y / tile_size / 32 % sh;
-        let tile_x = x / tile_size % 32;
-        let tile_y = y / tile_size % 32;
+        let (sc_w, sc_h) = self.bg_sc[bg].screen_size();
 
-        let sc_addr = base_addr + (sc_x + sc_y * sw) * SC_SIZE;
+        // FIXME: base_addr is 6bit (0x3F * 2K = 126K), but VRAM is 64KB ???
+        let base_addr = self.bg_sc[bg].base_addr() as usize * 2 * 1024;
+        let (tile_w, tile_h) = self.bg_mode.tile_size(bg);
+
+        let sc_x = x / tile_w / 32 % sc_w;
+        let sc_y = y / tile_h / 32 % sc_h;
+        let tile_x = x / tile_w % 32;
+        let tile_y = y / tile_h % 32;
+
+        let sc_addr = base_addr + (sc_x + sc_y * sc_w) * SC_SIZE;
         let entry_addr = (sc_addr + (tile_x + tile_y * 32) * 2) & 0xFFFE;
 
         self.vram[entry_addr..entry_addr + 2].try_into().unwrap()
@@ -1406,9 +1405,6 @@ impl Ppu {
             ((n as i32) << 19) >> 19
         }
 
-        let sy = (y ^ y_flip) as i32;
-        let sx = x_flip as i32;
-
         let m7a = sext16(self.rot_param.a);
         let m7b = sext16(self.rot_param.b);
         let m7c = sext16(self.rot_param.c);
@@ -1429,16 +1425,11 @@ impl Ppu {
 
         let lx = ((m7a * orgx) & !0x3F) + ((m7b * orgy) & !0x3F) + m7x * 0x100;
         let ly = ((m7c * orgx) & !0x3F) + ((m7d * orgy) & !0x3F) + m7y * 0x100;
-        let lx = lx + ((m7b * sy) & !0x3F) + (m7a * sx) as i32;
-        let ly = ly + ((m7d * sy) & !0x3F) + (m7c * sx) as i32;
-
-        let dx = if x_flip != 0 { -m7a } else { m7a };
-        let dy = if y_flip != 0 { -m7c } else { m7c };
+        let sy = (y ^ y_flip) as i32;
+        let lx = lx + ((m7b * sy) & !0x3F);
+        let ly = ly + ((m7d * sy) & !0x3F);
 
         for x in 0..SCREEN_WIDTH {
-            let vx = lx + dx * (x as i32);
-            let vy = ly + dy * (x as i32);
-
             let in_win = win_calc.contains(x);
             let render_main = enable_main && !(win_disable_main && in_win);
             let render_sub = enable_sub && !(win_disable_sub && in_win);
@@ -1446,6 +1437,8 @@ impl Ppu {
                 continue;
             }
 
+            let vx = lx + m7a * ((x ^ x_flip) as i32);
+            let vy = ly + m7c * ((x ^ x_flip) as i32);
             let ofs_x = ((vx >> 8) & 7) as usize;
             let ofs_y = ((vy >> 8) & 7) as usize;
             let tile_x = ((vx >> 11) & 0x7F) as usize;
@@ -1628,8 +1621,21 @@ impl Ppu {
     }
 
     fn color_math(&mut self) {
+        if self.bg_mode.hires() {
+            self.color_math_hires();
+            return;
+        }
+
         let win_calc = self.win_calc_math();
         let master_brightness = self.display_ctrl.master_brightness();
+        let sub_screen_enable = self.color_math_ctrl.sub_screen_enable();
+
+        info!(
+            "Color Math: y = {}, win calc = {:#?}, enable = {:#?}",
+            self.y - 1,
+            win_calc,
+            self.color_math_ctrl
+        );
 
         for x in 0..SCREEN_WIDTH {
             let in_win = win_calc.contains(x);
@@ -1647,7 +1653,7 @@ impl Ppu {
                 self.line_buffer_main[x as usize]
             });
 
-            let sub = Rgb555::from(if self.color_math_ctrl.sub_screen_enable() {
+            let sub = Rgb555::from(if sub_screen_enable {
                 self.line_buffer_sub[x as usize]
             } else {
                 self.sub_backdrop.into()
@@ -1660,16 +1666,16 @@ impl Ppu {
                 ColorMathEnable::Never => false,
             };
 
-            let enable = if !enable {
-                false
-            } else {
+            let enable = enable && {
                 let pixel_kind = self.attr_buffer_main[x as usize].kind();
                 self.color_math_ctrl.color_math_enable_kind() & (1 << pixel_kind) != 0
             };
 
-            let half_color = !force_main_black
-                && self.attr_buffer_sub[x as usize].kind() != PIXEL_KIND_BACKDROP
-                && self.color_math_ctrl.color_math_half();
+            let sub_is_transparent =
+                sub_screen_enable && self.attr_buffer_sub[x as usize].kind() == PIXEL_KIND_BACKDROP;
+
+            let half_color =
+                !force_main_black && !sub_is_transparent && self.color_math_ctrl.color_math_half();
 
             let result = if enable {
                 if self.color_math_ctrl.color_math_subtract() {
@@ -1695,7 +1701,37 @@ impl Ppu {
                 result.fade(master_brightness + 1)
             };
 
-            self.line_buffer_main[x as usize] = result.into();
+            // self.line_buffer_main[x as usize] = result.into();
+            // self.copy_line_buffer(self.y - 1);
+
+            let fb_x = x as usize * 2;
+            let fb_y = (self.y as usize - 1) * 2;
+            let pixel = u16_to_pixel(result.into());
+            *self.frame_buffer.pixel_mut(fb_x, fb_y) = pixel.clone();
+            *self.frame_buffer.pixel_mut(fb_x + 1, fb_y) = pixel.clone();
+            *self.frame_buffer.pixel_mut(fb_x, fb_y + 1) = pixel.clone();
+            *self.frame_buffer.pixel_mut(fb_x + 1, fb_y + 1) = pixel;
+        }
+    }
+
+    fn color_math_hires(&mut self) {
+        let master_brightness = self.display_ctrl.master_brightness();
+        let fb_y = (self.y as usize - 1) * 2;
+        for x in 0..SCREEN_WIDTH as usize * 2 {
+            let pixel = if master_brightness == 0 {
+                Rgb555::from(0)
+            } else {
+                Rgb555::from(if x & 1 == 0 {
+                    self.line_buffer_sub[x / 2]
+                } else {
+                    self.line_buffer_main[x / 2]
+                })
+                .fade(master_brightness + 1)
+            };
+
+            let pixel = u16_to_pixel(pixel.into());
+            *self.frame_buffer.pixel_mut(x, fb_y) = pixel.clone();
+            *self.frame_buffer.pixel_mut(x, fb_y + 1) = pixel;
         }
     }
 }
