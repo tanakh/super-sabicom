@@ -747,12 +747,15 @@ impl Cpu {
             }};
 
             (jsr far) => {{
-                let addr = self.fetch24(ctx);
+                let pc = self.fetch16(ctx);
                 ctx.elapse(INTERNAL_CYCLE);
+                // Before reading PB, JSL pushes PB to stack.
+                // This affects the behavior of open-bus.
                 self.push8(ctx, self.regs.pb);
+                let pb = self.fetch8(ctx);
                 self.push16(ctx, self.regs.pc.wrapping_sub(1));
-                self.regs.pb = (addr >> 16) as u8;
-                self.regs.pc = addr as u16;
+                self.regs.pb = pb;
+                self.regs.pc = pc;
             }};
             (jsr abs) => {{
                 let addr = addr!(abs, false).unwrap();
@@ -761,6 +764,8 @@ impl Cpu {
                 self.regs.pc = addr as u16;
             }};
             (jsr aix) => {{
+                // FIXME: JSR (abs, X) pushes the old address (low byte second)
+                // before reading the high byte of the new address.
                 let addr = addr!(aix, false).unwrap();
                 self.push16(ctx, self.regs.pc.wrapping_sub(1));
                 self.regs.pc = addr as u16;
