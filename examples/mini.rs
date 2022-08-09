@@ -117,9 +117,9 @@ fn print_game_info(snes: &Snes) {
     }
 }
 
-const SCREEN_WIDTH: u32 = 256;
-const SCREEN_HEIGHT: u32 = 224;
-const SCALING: u32 = 2;
+const SCREEN_WIDTH: u32 = 512;
+const SCREEN_HEIGHT: u32 = 448;
+const SCALING: u32 = 1;
 
 fn run(rom_path: &Path) -> Result<()> {
     let bytes = load_rom_file(&rom_path)?;
@@ -419,6 +419,7 @@ fn keycode_to_scancode(keycode: &KeyCode) -> Scancode {
         KeyCode::Down => Scancode::Down,
         KeyCode::Left => Scancode::Left,
         KeyCode::Right => Scancode::Right,
+        KeyCode::Space => Scancode::Space,
         _ => todo!(),
     }
 }

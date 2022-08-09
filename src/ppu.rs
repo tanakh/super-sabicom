@@ -1,5 +1,7 @@
 #![allow(unused_braces)]
 
+use std::collections::VecDeque;
+
 use educe::Educe;
 use log::{debug, info, warn};
 use meru_interface::{FrameBuffer, Pixel};
@@ -74,6 +76,11 @@ pub struct Ppu {
     hv_latched: bool,
     bg_old: u8,
     m7_old: u8,
+
+    pending_irqs: VecDeque<u64>,
+
+    open_bus1: u8,
+    open_bus2: u8,
 
     frame_buffer: FrameBuffer,
 
@@ -488,8 +495,6 @@ impl Ppu {
 
 impl Ppu {
     pub fn tick(&mut self, ctx: &mut impl Context, render: bool) {
-        let now = ctx.now();
-
         loop {
             let short_line =
                 self.display_ctrl.v_scanning() == 0 && self.frame % 2 == 1 && self.y == 240;
@@ -499,7 +504,7 @@ impl Ppu {
                 6
             };
 
-            if self.counter + dot_cycle > now {
+            if self.counter + dot_cycle > ctx.now() {
                 break;
             }
 
@@ -532,6 +537,12 @@ impl Ppu {
                 }
             }
 
+            while !self.pending_irqs.is_empty() && self.pending_irqs[0] <= self.counter {
+                info!("Set IRQ @ ({}, {})", self.x, self.y);
+                self.pending_irqs.pop_front();
+                ctx.interrupt_mut().set_irq(true);
+            }
+
             // FIXME: x == 0.5, not 1
             if (self.x, self.y) == (1, VBLANK_START) {
                 ctx.interrupt_mut().set_nmi_flag(true);
@@ -546,7 +557,9 @@ impl Ppu {
             }
 
             if (self.x, self.y) == (10, 225) {
-                self.oam_addr_internal = self.oam_addr.addr() << 1;
+                if !self.display_ctrl.force_blank() {
+                    self.oam_addr_internal = self.oam_addr.addr() << 1;
+                }
             }
 
             if render && self.x == 22 {
@@ -579,25 +592,22 @@ impl Ppu {
                 (self.x, self.y)
             };
 
-            let raise_irq = match ctx.interrupt().hvirq_enable() {
-                1 => {
-                    // FIXME: delay 3.5 dot
-                    x == ctx.interrupt().h_count() as u32
-                }
-                2 => {
-                    // FIXME: delay 2.5 dot
-                    x == 0 && y == ctx.interrupt().v_count() as u32
-                }
-                3 => {
-                    // FIXME: delay 3.5 dot (2.5 dot when h_count == 0)
-                    x == ctx.interrupt().h_count() as u32 && y == ctx.interrupt().v_count() as u32
-                }
-                _ => false,
+            let (raise_irq, delay) = match ctx.interrupt().hvirq_enable() {
+                1 => (x == ctx.interrupt().h_count() as u32, 14),
+                2 => (x == 0 && y == ctx.interrupt().v_count() as u32, 10),
+                3 => (
+                    x == ctx.interrupt().h_count() as u32 && y == ctx.interrupt().v_count() as u32,
+                    if ctx.interrupt().h_count() == 0 {
+                        10
+                    } else {
+                        14
+                    },
+                ),
+                _ => (false, 0),
             };
 
             if raise_irq {
-                log::info!("Set IRQ @ ({}, {})", x, y);
-                ctx.interrupt_mut().set_irq(true);
+                self.pending_irqs.push_back(self.counter + delay);
             }
         }
 
@@ -607,8 +617,8 @@ impl Ppu {
         counter.y = self.y;
     }
 
-    pub fn read(&mut self, ctx: &mut impl Context, addr: u16) -> u8 {
-        match addr {
+    pub fn read(&mut self, ctx: &mut impl Context, addr: u16, cpu_open_bus: u8) -> u8 {
+        let data = match addr {
             // PPU Picture Processing Unit (Read-Only Ports)
             // 0x2134 - MPYL    - "PPU1 Signed Multiply Result   (lower 8bit)"
             // 0x2135 - MPYM    - "PPU1 Signed Multiply Result   (middle 8bit)"
@@ -622,8 +632,7 @@ impl Ppu {
                 self.hv_latched = true;
                 self.h_latch = self.x;
                 self.v_latch = self.y;
-                // FIXME: open-bus
-                0
+                cpu_open_bus
             }
             // 0x2138 - RDOAM   - "PPU1 OAM Data Read            (read-twice)"
             0x2138 => {
@@ -633,6 +642,12 @@ impl Ppu {
                     // addresses 220h..3FFh are mirrors of 200h..21Fh
                     self.oam[self.oam_addr_internal as usize & 0x21F]
                 };
+
+                debug!(
+                    "OAM Read: {:03X} = {ret:02X}, y = {}",
+                    self.oam_addr_internal, self.y
+                );
+
                 self.oam_addr_internal = (self.oam_addr_internal + 1) & 0x3FF;
                 ret
             }
@@ -657,7 +672,7 @@ impl Ppu {
                 let ret = if self.cgram_addr & 1 == 0 {
                     word as u8
                 } else {
-                    (word >> 8) as u8
+                    (word >> 8) as u8 & 0x7F | self.open_bus2 & 0x80
                 };
                 self.cgram_addr = (self.cgram_addr + 1) & 0x1FF;
                 ret
@@ -668,8 +683,7 @@ impl Ppu {
                 if self.h_flipflop {
                     self.h_latch as u8
                 } else {
-                    // FIXME: Bit 1-7 is open-bus
-                    (self.h_latch >> 8) as u8 & 1
+                    (self.h_latch >> 8) as u8 & 1 | self.open_bus2 & 0xFE
                 }
             }
             // 0x213D - OPVCT   - "PPU2 Vertical Counter Latch   (read-twice)"
@@ -678,8 +692,7 @@ impl Ppu {
                 if self.v_flipflop {
                     self.v_latch as u8
                 } else {
-                    // FIXME: Bit 1-7 is open-bus
-                    (self.v_latch >> 8) as u8 & 1
+                    (self.v_latch >> 8) as u8 & 1 | self.open_bus2 & 0xFE
                 }
             }
             // 0x213E - STAT77  - "PPU1 Status and PPU1 Version Number"
@@ -691,8 +704,6 @@ impl Ppu {
 
                 // 3-0  PPU1 5C77 Version Number (only version 1 exists as far as I know)
                 ret |= PPU1_VERSION;
-                // FIXME:
-                // 4    Not used (PPU1 open bus) (same as last value read from PPU1)
                 // 5    Master/Slave Mode (PPU1.Pin25) (0=Normal=Master)
                 ret |= PPU1_MASTER << 5;
                 // 6    OBJ Range overflow (0=Okay, 1=More than 32 OBJs per scanline)
@@ -700,7 +711,7 @@ impl Ppu {
                 // 7    OBJ Time overflow  (0=Okay, 1=More than 8x34 OBJ pixels per scanline)
                 ret |= (self.obj_time_overflow as u8) << 7;
 
-                ret
+                ret | self.open_bus1 & 0x10
             }
             // 0x213F - STAT78  - "PPU2 Status and PPU2 Version Number"
             0x213F => {
@@ -711,7 +722,6 @@ impl Ppu {
 
                 ret |= PPU2_VERSION;
                 ret |= FRAME_RATE << 4;
-                // FIXME: 5 is open-bus
                 ret |= (self.hv_latched as u8) << 6;
                 ret |= ((self.frame & 1) as u8) << 7;
 
@@ -719,15 +729,37 @@ impl Ppu {
                 self.h_flipflop = false;
                 self.v_flipflop = false;
 
-                ret
+                ret | self.open_bus2 & 0x20
             }
 
-            _ => {
-                // FIXME: Open-bus
-                warn!("PPU Read (open-bus): {addr:04X}");
-                0
-            }
+            0x2104..=0x2106
+            | 0x2108..=0x210A
+            | 0x2114..=0x2116
+            | 0x2118..=0x211A
+            | 0x2124..=0x2126
+            | 0x2128..=0x212A => self.open_bus1,
+
+            0x2100..=0x2103
+            | 0x2107
+            | 0x210B..=0x210F
+            | 0x2110..=0x2113
+            | 0x2117
+            | 0x211B..=0x211F
+            | 0x2120..=0x2123
+            | 0x2127
+            | 0x212B..=0x212F
+            | 0x2130..=0x2133 => cpu_open_bus,
+
+            _ => unreachable!("PPU Read: {addr:04X}"),
+        };
+
+        match addr {
+            0x2134..=0x2136 | 0x2138..=0x213A | 0x213E => self.open_bus1 = data,
+            0x213B..=0x213D | 0x213F => self.open_bus2 = data,
+            _ => {}
         }
+
+        data
     }
 
     pub fn write(&mut self, ctx: &mut impl Context, addr: u16, data: u8) {
@@ -737,6 +769,7 @@ impl Ppu {
             0x2102 | 0x2103 => {
                 self.oam_addr.bytes[addr as usize - 0x2102] = data;
                 self.oam_addr_internal = self.oam_addr.addr() << 1;
+                debug!("OAM Addr = {:04X}, y = {}", self.oam_addr_internal, self.y);
             }
             0x2104 => {
                 if self.oam_addr_internal < 0x200 {
@@ -750,6 +783,10 @@ impl Ppu {
                     // addresses 220h..3FFh are mirrors of 200h..21Fh
                     self.oam[self.oam_addr_internal as usize & 0x21F] = data;
                 }
+                debug!(
+                    "OAM Write: {:04X} = {:02X}, y = {}, x = {}",
+                    self.oam_addr_internal, data, self.y, self.x
+                );
                 self.oam_addr_internal = (self.oam_addr_internal + 1) & 0x3FF;
             }
             0x2105 => {
@@ -774,6 +811,10 @@ impl Ppu {
                     self.m7_hofs = (data as u16) << 8 | self.m7_old as u16;
                     self.m7_old = data;
                 }
+                info!(
+                    "BG{ix}HOFS: {}, data = {:02X}, y = {}, x = {}",
+                    self.bg_hofs[ix], data, self.y, self.x
+                );
             }
             0x210E | 0x2110 | 0x2112 | 0x2114 => {
                 let ix = (addr - 0x210E) as usize / 2;
@@ -784,6 +825,10 @@ impl Ppu {
                     self.m7_vofs = (data as u16) << 8 | self.m7_old as u16;
                     self.m7_old = data;
                 }
+                info!(
+                    "BG{ix}VOFS: {}, data = {:02X}, y = {}, x = {}",
+                    self.bg_vofs[ix], data, self.y, self.x
+                );
             }
             0x2115 => self.vram_addr_inc_mode.bytes[0] = data,
             0x2116 => {
@@ -1629,13 +1674,6 @@ impl Ppu {
         let win_calc = self.win_calc_math();
         let master_brightness = self.display_ctrl.master_brightness();
         let sub_screen_enable = self.color_math_ctrl.sub_screen_enable();
-
-        info!(
-            "Color Math: y = {}, win calc = {:#?}, enable = {:#?}",
-            self.y - 1,
-            win_calc,
-            self.color_math_ctrl
-        );
 
         for x in 0..SCREEN_WIDTH {
             let in_win = win_calc.contains(x);

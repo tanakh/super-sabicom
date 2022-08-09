@@ -3,7 +3,7 @@ use super_sabicom_macro::{context, delegate};
 use crate::{bus, cartridge, cpu, ppu, rom, spc};
 
 pub trait Cpu {
-    fn reset(&mut self);
+    fn cpu_reset(&mut self);
     fn exec_one(&mut self);
 }
 
@@ -24,7 +24,7 @@ pub trait Ppu {
     fn ppu(&self) -> &ppu::Ppu;
     fn ppu_mut(&mut self) -> &mut ppu::Ppu;
 
-    fn ppu_read(&mut self, addr: u16) -> u8;
+    fn ppu_read(&mut self, addr: u16, cpu_open_bus: u8) -> u8;
     fn ppu_write(&mut self, addr: u16, data: u8);
     fn ppu_tick(&mut self, render: bool);
 }
@@ -34,6 +34,7 @@ pub trait Spc {
     fn spc(&self) -> &spc::Spc;
     fn spc_mut(&mut self) -> &mut spc::Spc;
 
+    fn spc_reset(&mut self);
     fn spc_tick(&mut self);
 }
 
@@ -176,14 +177,16 @@ impl Context {
             Default::default(),
             Default::default(),
         );
-        ret.reset();
+
+        ret.cpu_reset();
+        ret.spc_reset();
 
         ret
     }
 }
 
 impl Cpu for Context {
-    fn reset(&mut self) {
+    fn cpu_reset(&mut self) {
         self.cpu.reset(&mut self.inner);
     }
 
@@ -201,7 +204,7 @@ impl Bus for Inner1 {
     }
 
     fn read(&mut self, addr: u32) -> u8 {
-        self.bus.read::<_, false>(&mut self.inner, addr)
+        self.bus.read::<_, 0>(&mut self.inner, addr)
     }
 
     fn read_pure(&self, addr: u32) -> Option<u8> {
@@ -209,7 +212,12 @@ impl Bus for Inner1 {
     }
 
     fn write(&mut self, addr: u32, data: u8) {
-        self.bus.write::<_, false>(&mut self.inner, addr, data)
+        // FIXME: hack for sub-instruction cycle accuracy
+        // FIXME: render flag
+        self.ppu_tick(true);
+        self.bus.tick(&mut self.inner);
+
+        self.bus.write::<_, 0>(&mut self.inner, addr, data)
     }
 
     fn bus_locked(&self) -> bool {
@@ -229,8 +237,8 @@ impl Ppu for Inner2 {
         &mut self.ppu
     }
 
-    fn ppu_read(&mut self, addr: u16) -> u8 {
-        self.ppu.read(&mut self.inner, addr)
+    fn ppu_read(&mut self, addr: u16, cpu_open_bus: u8) -> u8 {
+        self.ppu.read(&mut self.inner, addr, cpu_open_bus)
     }
 
     fn ppu_write(&mut self, addr: u16, data: u8) {
@@ -250,6 +258,9 @@ impl Spc for Inner2 {
         &mut self.spc
     }
 
+    fn spc_reset(&mut self) {
+        self.spc.reset();
+    }
     fn spc_tick(&mut self) {
         self.spc.tick(&mut self.inner)
     }

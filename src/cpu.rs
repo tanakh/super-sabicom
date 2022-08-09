@@ -494,13 +494,15 @@ impl Cpu {
         }
 
         if ctx.interrupt_mut().nmi() {
-            ctx.elapse(INTERNAL_CYCLE * 2);
+            let _ = ctx.read(self.regs.pc24());
+            ctx.elapse(INTERNAL_CYCLE);
             self.exception(ctx, Exception::Nmi);
             return;
         }
 
         if !prev_i && ctx.interrupt().irq() {
-            ctx.elapse(INTERNAL_CYCLE * 2);
+            let _ = ctx.read(self.regs.pc24());
+            ctx.elapse(INTERNAL_CYCLE);
             self.exception(ctx, Exception::Irq);
             return;
         }

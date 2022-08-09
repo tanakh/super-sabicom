@@ -35,6 +35,7 @@ pub struct Bus {
     locked: bool,
     gdma_do_transfer: bool,
     controller_port: [ControllerPort; 2],
+    open_bus: u8,
 
     wram: Vec<u8>,
     wram_addr: u32,
@@ -156,6 +157,7 @@ impl Default for Bus {
             locked: false,
             gdma_do_transfer: false,
             controller_port: Default::default(),
+            open_bus: 0,
             wram: vec![0; 0x20000], // 128KB
             wram_addr: 0,
         }
@@ -169,6 +171,10 @@ struct ControllerPort {
     clk: bool,
     pos: usize,
 }
+
+const NOT_DMA: u8 = 0;
+const DMA_A: u8 = 1;
+const DMA_B: u8 = 2;
 
 impl Bus {
     pub fn set_input(&mut self, input: &meru_interface::InputData) {
@@ -211,58 +217,75 @@ impl Bus {
         self.dma_exec(ctx);
     }
 
-    pub fn read<C: Context, const DMA: bool>(&mut self, ctx: &mut C, addr: u32) -> u8 {
+    pub fn read<C: Context, const DMA: u8>(&mut self, ctx: &mut C, addr: u32) -> u8 {
         let bank = addr >> 16;
         let offset = addr as u16;
 
         let data = match bank {
             0x00..=0x3F | 0x80..=0xBF => match offset {
                 0x0000..=0x1FFF => {
-                    if !DMA {
+                    if DMA == NOT_DMA {
                         ctx.elapse(CYCLES_SLOW);
                     }
                     self.wram[offset as usize]
                 }
                 0x2000..=0x20FF => {
-                    if !DMA {
-                        ctx.elapse(CYCLES_FAST);
-                    }
-                    warn!("Read unused region: {bank:02X}:{offset:04X}");
-                    0
-                }
-                0x2100..=0x21FF => {
-                    if !DMA {
-                        ctx.elapse(CYCLES_FAST);
-                    }
-                    self.io_read(ctx, offset)
-                }
-                0x2200..=0x3FFF => {
-                    if !DMA {
+                    if DMA == NOT_DMA {
                         ctx.elapse(CYCLES_FAST);
                     }
                     warn!("Read unused region (open bus): {bank:02X}:{offset:04X}");
-                    0
+                    self.open_bus
                 }
-                0x4000..=0x41FF => {
-                    if !DMA {
-                        ctx.elapse(CYCLES_JOY);
-                    }
-                    self.io_read(ctx, offset)
-                }
-                0x4200..=0x5FFF => {
-                    if !DMA {
+                0x2100..=0x21FF => {
+                    if DMA == NOT_DMA {
                         ctx.elapse(CYCLES_FAST);
                     }
-                    self.io_read(ctx, offset)
+
+                    if DMA != DMA_A {
+                        self.io_read(ctx, offset)
+                    } else {
+                        self.open_bus
+                    }
+                }
+                0x2200..=0x3FFF => {
+                    if DMA == NOT_DMA {
+                        ctx.elapse(CYCLES_FAST);
+                    }
+                    warn!("Read unused region (open bus): {bank:02X}:{offset:04X}");
+                    self.open_bus
+                }
+                0x4000..=0x41FF => {
+                    if DMA == NOT_DMA {
+                        ctx.elapse(CYCLES_JOY);
+                    }
+                    if DMA != DMA_A {
+                        self.io_read(ctx, offset)
+                    } else {
+                        self.open_bus | if addr == 0x4017 { 0x1C } else { 0 }
+                    }
+                }
+                0x4200..=0x5FFF => {
+                    if DMA == NOT_DMA {
+                        ctx.elapse(CYCLES_FAST);
+                    }
+                    if DMA != DMA_A {
+                        self.io_read(ctx, offset)
+                    } else {
+                        match addr {
+                            0x4210..=0x421F => self.io_read(ctx, offset),
+                            0x4300..=0x437F => 0xFF, // Special open bus
+                            _ => self.open_bus,
+                        }
+                    }
                 }
                 0x6000..=0x7FFF => {
-                    if !DMA {
+                    if DMA == NOT_DMA {
                         ctx.elapse(CYCLES_SLOW);
                     }
                     ctx.cartridge().read(addr)
                 }
                 0x8000..=0xFFFF => {
-                    if !DMA {
+                    if DMA == NOT_DMA {
                         ctx.elapse(if bank & 0x80 == 0 {
                             CYCLES_SLOW
                         } else {
@@ -273,19 +296,19 @@ impl Bus {
                 }
             },
             0x40..=0x7D => {
-                if !DMA {
+                if DMA == NOT_DMA {
                     ctx.elapse(CYCLES_SLOW);
                 }
                 ctx.cartridge().read(addr)
             }
             0x7E..=0x7F => {
-                if !DMA {
+                if DMA == NOT_DMA {
                     ctx.elapse(CYCLES_SLOW);
                 }
                 self.wram[(addr & 0x1FFFF) as usize]
             }
             0xC0..=0xFF => {
-                if !DMA {
+                if DMA == NOT_DMA {
                     ctx.elapse(self.ws2_access_cycle);
                 }
                 ctx.cartridge().read(addr)
@@ -293,6 +316,7 @@ impl Bus {
             _ => unreachable!(),
         };
         trace!("Read:  {bank:02X}:{offset:04X} = {data:#04X}");
+        self.open_bus = data;
         data
     }
 
@@ -313,58 +337,70 @@ impl Bus {
         })
     }
 
-    pub fn write<C: Context, const DMA: bool>(&mut self, ctx: &mut C, addr: u32, data: u8) {
+    pub fn write<C: Context, const DMA: u8>(&mut self, ctx: &mut C, addr: u32, data: u8) {
         let bank = addr >> 16;
         let offset = addr as u16;
 
         trace!("Write:  {bank:02X}:{offset:04X} = {data:#04X}");
+        self.open_bus = data;
 
         match bank {
             0x00..=0x3F | 0x80..=0xBF => match offset {
                 0x0000..=0x1FFF => {
-                    if !DMA {
+                    if DMA == NOT_DMA {
                         ctx.elapse(CYCLES_SLOW);
                     }
                     self.wram[offset as usize] = data;
                 }
                 0x2000..=0x20FF => {
-                    if !DMA {
+                    if DMA == NOT_DMA {
                         ctx.elapse(CYCLES_FAST);
                     }
                     warn!("Write unused region: {bank:02X}:{offset:04X}");
                 }
                 0x2100..=0x21FF => {
-                    if !DMA {
+                    if DMA == NOT_DMA {
                         ctx.elapse(CYCLES_FAST);
                     }
-                    self.io_write(ctx, offset, data);
+                    if DMA != DMA_A {
+                        self.io_write(ctx, offset, data);
+                    }
                 }
                 0x2200..=0x3FFF => {
-                    if !DMA {
+                    if DMA == NOT_DMA {
                         ctx.elapse(CYCLES_FAST);
                     }
                     warn!("Write unused region: {bank:02X}:{offset:04X}")
                 }
                 0x4000..=0x41FF => {
-                    if !DMA {
+                    if DMA == NOT_DMA {
                         ctx.elapse(CYCLES_JOY);
                     }
-                    self.io_write(ctx, offset, data);
+                    if DMA != DMA_A {
+                        self.io_write(ctx, offset, data);
+                    }
                 }
                 0x4200..=0x5FFF => {
-                    if !DMA {
+                    if DMA == NOT_DMA {
                         ctx.elapse(CYCLES_FAST);
                     }
-                    self.io_write(ctx, offset, data);
+                    if DMA != DMA_A {
+                        self.io_write(ctx, offset, data);
+                    } else {
+                        match addr {
+                            0x4210..=0x421F => self.io_write(ctx, offset, data),
+                            _ => {}
+                        }
+                    }
                 }
                 0x6000..=0x7FFF => {
-                    if !DMA {
+                    if DMA == NOT_DMA {
                         ctx.elapse(CYCLES_SLOW);
                     }
                     ctx.cartridge_mut().write(addr, data);
                 }
                 0x8000..=0xFFFF => {
-                    if !DMA {
+                    if DMA == NOT_DMA {
                         ctx.elapse(if bank & 0x80 == 0 {
                             CYCLES_SLOW
                         } else {
@@ -375,19 +411,19 @@ impl Bus {
                 }
             },
             0x40..=0x7D => {
-                if !DMA {
+                if DMA == NOT_DMA {
                     ctx.elapse(CYCLES_SLOW);
                 }
                 ctx.cartridge_mut().write(addr, data)
             }
             0x7E..=0x7F => {
-                if !DMA {
+                if DMA == NOT_DMA {
                     ctx.elapse(CYCLES_SLOW);
                 }
                 self.wram[(addr & 0x1FFFF) as usize] = data
             }
             0xC0..=0xFF => {
-                if !DMA {
+                if DMA == NOT_DMA {
                     ctx.elapse(self.ws2_access_cycle);
                 }
                 ctx.cartridge_mut().write(addr, data);
@@ -396,7 +432,7 @@ impl Bus {
         }
     }
 
-    fn read16<C: Context, const DMA: bool>(&mut self, ctx: &mut C, addr: u32) -> u16 {
+    fn read16<C: Context, const DMA: u8>(&mut self, ctx: &mut C, addr: u32) -> u16 {
         let b0 = self.read::<_, DMA>(ctx, addr);
         let b1 = self.read::<_, DMA>(ctx, addr & 0xFF0000 | (addr as u16).wrapping_add(1) as u32);
         (b1 as u16) << 8 | b0 as u16
@@ -408,19 +444,23 @@ impl Bus {
         ctx.ppu_tick(true);
 
         let data = match addr {
-            0x2100..=0x213F => ctx.ppu_read(addr),
-            0x2140..=0x217F => ctx.spc().read_port((addr & 3) as _),
+            // FIXME: Does PPU open bus affect CPU open bus?
+            0x2100..=0x213F => ctx.ppu_read(addr, self.open_bus),
+
+            0x2140..=0x217F => {
+                let now = ctx.now();
+                let ret = ctx.spc_mut().read_port((addr & 3) as _, now);
+                if addr & 3 == 1 {
+                    debug!("SPC {} -> {:02X} @ {}", addr & 3, ret, ctx.now());
+                }
+                ret
+            }
 
             // WMDATA  - WRAM Data Read/Write
             0x2180 => {
                 let ret = self.wram[self.wram_addr as usize];
                 self.wram_addr = (self.wram_addr + 1) & 0x1FFFF;
                 ret
-            }
-
-            0x2181..=0x3FFF => {
-                warn!("Read open bus: {addr:04X}");
-                0
             }
 
             // CPU On-Chip I/O Ports
@@ -431,7 +471,7 @@ impl Bus {
                 let b1 = !self.controller_read(0, 5);
                 self.controller_write(0, 2, true);
                 self.controller_write(0, 2, false);
-                b0 as u8 | (b1 as u8) << 1
+                b0 as u8 | (b1 as u8) << 1 | self.open_bus & 0x7C
             }
             // JOYB - Joypad Input Register B (R)
             0x4017 => {
@@ -441,18 +481,15 @@ impl Bus {
                 let b1 = !self.controller_read(1, 5);
                 self.controller_write(1, 2, true);
                 self.controller_write(1, 2, false);
-                b0 as u8 | (b1 as u8) << 1 | 0x1C
+                b0 as u8 | (b1 as u8) << 1 | 0x1C | self.open_bus & 0xE0
             }
-
-            // CPU On-Chip I/O Ports (Write-only) (Read=open bus)
-            0x4200..=0x420F => 0,
 
             // CPU On-Chip I/O Ports (Read-only)
             // RDNMI - V-Blank NMI Flag and CPU Version Number (Read/Ack)
             0x4210 => {
                 let nmi_flag = ctx.interrupt_mut().nmi_flag();
                 let cpu_version = 2; // ???
-                (nmi_flag as u8) << 7 | cpu_version
+                (nmi_flag as u8) << 7 | cpu_version | self.open_bus & 0x70
             }
 
             // TIMEUP - H/V-Timer IRQ Flag (Read/Ack)
@@ -460,15 +497,15 @@ impl Bus {
                 let ret = (ctx.interrupt().irq() as u8) << 7;
                 // 0-6: FIXME: open-bus
                 ctx.interrupt_mut().set_irq(false);
-                ret
+                ret | self.open_bus & 0x7F
             }
             // HVBJOY - H/V-Blank flag and Joypad Busy flag (R)
             0x4212 => {
                 let mut ret = 0;
-                // 0: Joypad busy
+                // FIXME: bit 0 = Auto-Joypad-Read Busy Flag (1=Busy)
                 ret |= (ctx.ppu().hblank() as u8) << 6;
                 ret |= (ctx.ppu().vblank() as u8) << 7;
-                ret
+                ret | self.open_bus & 0x3E
             }
 
             // RDIO    - Joypad Programmable I/O Port (Input)
@@ -493,16 +530,19 @@ impl Bus {
                 (self.controller_port[i % 2].pad_data[i / 2] >> (8 * h)) as u8
             }
 
-            // 4220h..42FFh    - Unused region (open bus)
-            0x4220..=0x42FF => 0,
-
             // CPU DMA, For below ports, x = Channel number 0..7 (R/W)
             0x4300..=0x437F => self.dma_read(((addr >> 4) & 0x7) as _, (addr & 0xF) as _),
 
-            _ => todo!(
-                "IO Read: {addr:#06X}{}",
-                ioreg_info(addr).map_or_else(|| "".to_string(), |info| format!("({})", info.name))
-            ),
+            0x2181..=0x3FFF
+            | 0x4000..=0x4015
+            | 0x4018..=0x420F
+            | 0x4220..=0x42FF
+            | 0x4380..=0x5FFF => {
+                warn!("Read open bus: {addr:04X}");
+                self.open_bus
+            }
+
+            _ => unreachable!("IO Read: {addr:#06X}"),
         };
 
         trace!(
@@ -521,8 +561,11 @@ impl Bus {
         match addr {
             0x2100..=0x213F => ctx.ppu_write(addr, data),
             0x2140..=0x217F => {
-                debug!("SPC PORT[{}] = {data:02X} @ {}", addr & 3, ctx.now());
-                ctx.spc_mut().write_port((addr & 3) as _, data);
+                if addr & 3 == 1 {
+                    debug!("SPC {} <- {:02X} @ {}", addr & 3, data, ctx.now());
+                }
+                let now = ctx.now();
+                ctx.spc_mut().write_port((addr & 3) as _, data, now);
             }
 
             0x2180 => {
@@ -532,8 +575,6 @@ impl Bus {
             0x2181 => self.wram_addr = (self.wram_addr & 0x1FF00) | data as u32,
             0x2182 => self.wram_addr = (self.wram_addr & 0x100FF) | ((data as u32) << 8),
             0x2183 => self.wram_addr = (self.wram_addr & 0x0FFFF) | ((data as u32 & 1) << 16),
-
-            0x2184..=0x21FF => error!("Write to Unused region: {addr:#06X} = {data:#04X}"),
 
             // CPU On-Chip I/O Ports
             0x4016 => {
@@ -595,18 +636,22 @@ impl Bus {
             }
             0x420B => {
                 self.gdma_enable = data;
-                info!("GDMA Enable: {data:08b}");
+                info!("GDMA Enable: {data:08b} @ y = {}", ctx.counter().y);
             }
             0x420C => {
                 self.hdma_enable = data;
-                info!("HDMA Enable: {data:08b}");
+                info!("HDMA Enable: {data:08b} @ y = {}", ctx.counter().y);
             }
             0x420D => self.ws2_access_cycle = if data & 1 == 0 { 8 } else { 6 },
 
             // CPU DMA, For below ports, x = Channel number 0..7 (R/W)
             0x4300..=0x437F => self.dma_write(((addr >> 4) & 0x7) as _, (addr & 0xF) as _, data),
 
-            _ => error!("IO Write: {addr:#06X} = {data:#04X}"),
+            0x2184..=0x4015 | 0x4017..=0x41FF | 0x420E..=0x42FF | 0x4380..=0x5FFF => {
+                warn!("Write to Unused region: {addr:#06X} = {data:#04X}")
+            }
+
+            _ => unreachable!("IO Write: {addr:#06X} = {data:#04X}"),
         }
     }
 
@@ -626,7 +671,7 @@ impl Bus {
             0xB | 0xF => self.dma[ch].unused,
             0xC..=0xE => {
                 warn!("Invalid DMA register read: {cmd:0X}");
-                0
+                self.open_bus
             }
             _ => unreachable!(),
         }
@@ -757,12 +802,12 @@ impl Bus {
 
             match transfer_dir {
                 DmaTransferDir::CpuToIo => {
-                    let data = self.read::<_, true>(ctx, cpu_addr);
-                    self.write::<_, true>(ctx, io_addr, data);
+                    let data = self.read::<_, DMA_A>(ctx, cpu_addr);
+                    self.write::<_, DMA_B>(ctx, io_addr, data);
                 }
                 DmaTransferDir::IoToCpu => {
-                    let data = self.read::<_, true>(ctx, io_addr);
-                    self.write::<_, true>(ctx, cpu_addr, data);
+                    let data = self.read::<_, DMA_B>(ctx, io_addr);
+                    self.write::<_, DMA_A>(ctx, cpu_addr, data);
                 }
             }
             // 8 cycles for each byte
@@ -796,10 +841,10 @@ impl Bus {
         self.dma[ch].hdma_cur_addr = self.dma[ch].cur_addr;
 
         let addr = self.dma[ch].hdma_addr(1);
-        let v = self.read::<_, true>(ctx, addr);
+        let v = self.read::<_, DMA_A>(ctx, addr);
         // ctx.elapse(8);
         if v == 0 {
-            warn!("HDMA{ch}: Empty table");
+            info!("HDMA{ch}: Empty table");
             self.dma[ch].hdma_done_transfer = true;
             return;
         }
@@ -807,7 +852,7 @@ impl Bus {
 
         if matches!(self.dma[ch].param.addr_mode(), DmaAddrMode::Indirect) {
             let addr = self.dma[ch].hdma_addr(2);
-            self.dma[ch].byte_count_or_indirect_hdma_addr = self.read16::<_, true>(ctx, addr);
+            self.dma[ch].byte_count_or_indirect_hdma_addr = self.read16::<_, DMA_A>(ctx, addr);
             debug!(
                 "HDMA{ch}: Indirect addr = {:04X}",
                 self.dma[ch].byte_count_or_indirect_hdma_addr
@@ -850,12 +895,12 @@ impl Bus {
                     0x2100 | self.dma[ch].iobus_addr.wrapping_add(transfer_unit[i] as u8) as u32;
 
                 if matches!(self.dma[ch].param.transfer_dir(), DmaTransferDir::CpuToIo) {
-                    let data = self.read::<_, true>(ctx, cpu_addr);
-                    self.write::<_, true>(ctx, io_addr, data);
+                    let data = self.read::<_, DMA_A>(ctx, cpu_addr);
+                    self.write::<_, DMA_B>(ctx, io_addr, data);
                     debug!("HDMA: {cpu_addr:06X} -> {io_addr:04X} = {data:02X}");
                 } else {
-                    let data = self.read::<_, true>(ctx, io_addr);
-                    self.write::<_, true>(ctx, cpu_addr, data);
+                    let data = self.read::<_, DMA_B>(ctx, io_addr);
+                    self.write::<_, DMA_A>(ctx, cpu_addr, data);
                     debug!("HDMA: {io_addr:06X} -> {cpu_addr:04X} = {data:02X}");
                 }
 
@@ -876,7 +921,7 @@ impl Bus {
 
         if self.dma[ch].hdma_line_counter & 0x7F == 0 {
             let addr = self.dma[ch].hdma_addr(1);
-            let data = self.read::<_, true>(ctx, addr);
+            let data = self.read::<_, DMA_A>(ctx, addr);
             ctx.elapse(8);
             self.dma[ch].hdma_line_counter = data;
             self.locked = true;
@@ -890,13 +935,13 @@ impl Bus {
                 if self.dma[ch].hdma_line_counter != 0 {
                     let addr = self.dma[ch].hdma_addr(2);
                     self.dma[ch].byte_count_or_indirect_hdma_addr =
-                        self.read16::<_, true>(ctx, addr);
+                        self.read16::<_, DMA_A>(ctx, addr);
                     ctx.elapse(16);
                 } else {
                     // Odd behavior: if the line counter is 0, only 1 byte read and it is placed in MSB
                     let addr = self.dma[ch].hdma_addr(1);
                     self.dma[ch].byte_count_or_indirect_hdma_addr =
-                        (self.read::<_, true>(ctx, addr) as u16) << 8;
+                        (self.read::<_, DMA_A>(ctx, addr) as u16) << 8;
                     ctx.elapse(8);
                 }
             }
