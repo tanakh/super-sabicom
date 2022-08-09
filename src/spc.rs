@@ -6,6 +6,7 @@ use log::{debug, info, trace, warn, Level};
 use meru_interface::AudioBuffer;
 use modular_bitfield::prelude::*;
 use std::{
+    collections::VecDeque,
     fmt::Display,
     sync::atomic::{AtomicU64, Ordering},
 };
@@ -17,12 +18,24 @@ pub trait Context: context::Timing {}
 impl<T: context::Timing> Context for T {}
 
 pub struct Spc {
-    regs: Registers,
-    ioregs: IORegisters,
-    dsp: Dsp,
+    pub regs: Registers,
+    pub ioregs: IORegisters,
+    pub dsp: Dsp,
+
+    sleep: bool,
+    stop: bool,
+
+    pub bus_log: Vec<(Option<u16>, Option<u8>, BusAccessType)>,
 
     counter: u64,
     dsp_counter: u64,
+}
+
+#[derive(Debug, Clone)]
+pub enum BusAccessType {
+    Read,
+    Write,
+    Wait,
 }
 
 impl Default for Spc {
@@ -31,25 +44,28 @@ impl Default for Spc {
             regs: Registers::default(),
             ioregs: IORegisters::default(),
             dsp: Dsp::default(),
+            sleep: false,
+            stop: false,
+            bus_log: vec![],
             counter: 0,
             dsp_counter: 0,
         }
     }
 }
 
-struct Registers {
-    a: u8,
-    x: u8,
-    y: u8,
-    sp: u8,
-    psw: Flags,
-    pc: u16,
+pub struct Registers {
+    pub a: u8,
+    pub x: u8,
+    pub y: u8,
+    pub sp: u8,
+    pub psw: Flags,
+    pub pc: u16,
 }
 
 #[bitfield]
 #[repr(u8)]
 #[derive(Default, Clone, Copy)]
-struct Flags {
+pub struct Flags {
     c: bool, // 0: Borrow or no-carry, 1: Carry or no-borrow
     z: bool,
     i: bool,
@@ -94,16 +110,16 @@ impl Registers {
     }
 }
 
-struct IORegisters {
-    timer_enable: bool, // ???
-    ram_write_enable: bool,
-    crash_spc700: bool, // ???
-    ram_wait_cycle: u64,
-    io_wait_cycle: u64,
-    rom_enable: bool,
-    dsp_reg: u8,
-    cpuin: [u8; 4],
-    cpuout: [u8; 4],
+pub struct IORegisters {
+    pub timer_enable: bool, // ???
+    pub ram_write_enable: bool,
+    pub crash_spc700: bool, // ???
+    pub ram_wait_cycle: u64,
+    pub io_wait_cycle: u64,
+    pub rom_enable: bool,
+    pub dsp_reg: u8,
+    cpuin: [VecDeque<(u64, u8)>; 4],
+    cpuout: [VecDeque<(u64, u8)>; 4],
     ext_io: [u8; 2],
     timer: [Timer; 3],
     counter01: u64,
@@ -131,6 +147,12 @@ impl Default for Timer {
 
 impl Default for IORegisters {
     fn default() -> Self {
+        let port = [0, 1, 2, 3].map(|_| {
+            let mut v = VecDeque::new();
+            v.push_back((0, 0));
+            v
+        });
+
         Self {
             timer_enable: true,
             ram_write_enable: true,
@@ -139,8 +161,8 @@ impl Default for IORegisters {
             io_wait_cycle: 1,
             rom_enable: true,
             dsp_reg: 0,
-            cpuin: [0; 4],
-            cpuout: [0; 4],
+            cpuin: port.clone(),
+            cpuout: port.clone(),
             ext_io: [0; 2],
             timer: Default::default(),
             counter01: 0,
@@ -149,7 +171,18 @@ impl Default for IORegisters {
     }
 }
 
+fn master_to_spc_cycle(master: u64) -> u64 {
+    master * 10240 / 214772
+}
+
 impl Spc {
+    pub fn reset(&mut self) {
+        self.dsp.ram.fill(0);
+        for i in 0..0x40 {
+            self.dsp.ram[i + 0xFFC0] = BOOT_ROM[i];
+        }
+    }
+
     pub fn audio_buffer(&self) -> &AudioBuffer {
         &self.dsp.audio_buffer
     }
@@ -158,17 +191,36 @@ impl Spc {
         self.dsp.audio_buffer.samples.clear();
     }
 
-    pub fn read_port(&self, port: u8) -> u8 {
-        self.ioregs.cpuout[port as usize]
+    pub fn sync_port(&mut self, port: u8, cycle: u64, out: bool) {
+        let port = port as usize;
+        if !out {
+            while self.ioregs.cpuin[port].len() > 1 && self.ioregs.cpuin[port][1].0 <= cycle {
+                self.ioregs.cpuin[port].pop_front();
+            }
+        } else {
+            while self.ioregs.cpuout[port].len() > 1 && self.ioregs.cpuout[port][1].0 <= cycle {
+                self.ioregs.cpuout[port].pop_front();
+            }
+        }
     }
 
-    pub fn write_port(&mut self, port: u8, data: u8) {
-        self.ioregs.cpuin[port as usize] = data;
+    pub fn read_port(&mut self, port: u8, master_cycle: u64) -> u8 {
+        self.sync_port(port, master_to_spc_cycle(master_cycle), true);
+        self.ioregs.cpuout[port as usize][0].1
+    }
+
+    pub fn write_port(&mut self, port: u8, data: u8, master_clock: u64) {
+        self.ioregs.cpuin[port as usize].push_back((master_to_spc_cycle(master_clock), data))
     }
 
     pub fn tick(&mut self, ctx: &mut impl Context) {
-        let world = ctx.now() * 10240 / 214772;
+        let world = master_to_spc_cycle(ctx.now());
         let start = self.counter;
+
+        for i in 0..4 {
+            self.sync_port(i, start, false);
+            self.sync_port(i, start, true);
+        }
 
         while self.counter < world {
             self.exec_one();
@@ -255,6 +307,14 @@ opcodes! {
     mov x, zp  ; mov x, zpy  ; mov zp, zp   ; mov y, zpx    ; inc y     ; mov y, a  ; dbnz y, dest  ; stop         ; // F8
 }
 
+struct Wrap8Addr(u16);
+
+impl Wrap8Addr {
+    fn offset(&self, offset: u8) -> Self {
+        Self(self.0 & 0xFF00 | (self.0 as u8).wrapping_add(offset) as u16)
+    }
+}
+
 impl Spc {
     fn read8(&mut self, addr: u16) -> u8 {
         let data = match addr {
@@ -272,6 +332,9 @@ impl Spc {
             }
         };
         // trace!("Read:  {addr:#06X} = {data:#04X}");
+        // self.bus_log
+        //     .push((Some(addr), Some(data), BusAccessType::Read));
+
         data
     }
 
@@ -285,6 +348,8 @@ impl Spc {
 
     fn write8(&mut self, addr: u16, data: u8) {
         // trace!("Write: {addr:#06X} = {data:#04X}");
+        // self.bus_log
+        //     .push((Some(addr), Some(data), BusAccessType::Write));
         if self.ioregs.ram_write_enable {
             self.dsp.ram[addr as usize] = data;
         }
@@ -302,9 +367,10 @@ impl Spc {
         (hi as u16) << 8 | lo as u16
     }
 
-    fn write16(&mut self, addr: u16, data: u16) {
-        self.write8(addr, data as u8);
-        self.write8(addr.wrapping_add(1), (data >> 8) as u8);
+    fn read16_no_wrap(&mut self, addr: u16) -> u16 {
+        let lo = self.read8(addr);
+        let hi = self.read8(Wrap8Addr(addr).offset(1).0);
+        (hi as u16) << 8 | lo as u16
     }
 
     fn fetch8(&mut self) -> u8 {
@@ -353,8 +419,12 @@ impl Spc {
             2 => self.ioregs.dsp_reg,
             3 => self.dsp.read(self.ioregs.dsp_reg),
             4..=7 => {
-                let data = self.ioregs.cpuin[addr as usize - 4];
-                debug!("CPUIO {} -> {data:#04X}", addr as usize - 4);
+                let port = (addr - 4) as u8;
+                self.sync_port(port, self.counter, false);
+                let data = self.ioregs.cpuin[port as usize][0].1;
+                if addr - 4 == 1 {
+                    debug!("CPUIO {port} -> {data:#04X} @ {}", self.counter);
+                }
                 data
             }
             8..=9 => self.ioregs.ext_io[addr as usize - 8],
@@ -415,8 +485,10 @@ impl Spc {
                 }
                 for i in 0..2 {
                     if data & (1 << (i + 4)) != 0 {
-                        self.ioregs.cpuin[i * 2 + 0] = 0;
-                        self.ioregs.cpuin[i * 2 + 1] = 0;
+                        self.ioregs.cpuin[i * 2 + 0].clear();
+                        self.ioregs.cpuin[i * 2 + 0].push_back((0, 0));
+                        self.ioregs.cpuin[i * 2 + 1].clear();
+                        self.ioregs.cpuin[i * 2 + 1].push_back((0, 0));
                     }
                 }
                 self.ioregs.rom_enable = data & 0x80 != 0;
@@ -424,8 +496,11 @@ impl Spc {
             2 => self.ioregs.dsp_reg = data,
             3 => self.dsp.write(self.ioregs.dsp_reg, data),
             4..=7 => {
-                debug!("CPUIO {} <- {data:#04X}", addr as usize - 4);
-                self.ioregs.cpuout[addr as usize - 4] = data
+                let port = (addr - 4) as u8;
+                if addr - 4 == 1 {
+                    debug!("CPUIO {port} <- {data:#04X} @ {}", self.counter);
+                }
+                self.ioregs.cpuout[port as usize].push_back((self.counter, data));
             }
             8..=9 => self.ioregs.ext_io[addr as usize - 8] = data,
             0xA..=0xC => self.ioregs.timer[addr as usize - 0xA].divider = data,
@@ -438,18 +513,41 @@ impl Spc {
 }
 
 impl Spc {
-    fn exec_one(&mut self) {
-        if log::log_enabled!(Level::Trace) {
+    pub fn exec_one(&mut self) {
+        static LAST_CYCLE: AtomicU64 = AtomicU64::new(0);
+
+        if self.counter - LAST_CYCLE.load(Ordering::Relaxed) > 10000 {
+            log::info!("CYCLE: {}", self.counter);
+            LAST_CYCLE.store(self.counter, Ordering::Relaxed);
+        }
+
+        if self.counter >= 1246965 && log::log_enabled!(Level::Trace) {
             self.trace();
         }
 
+        macro_rules! bus_log {
+            ($n:expr) => {
+                // for _ in 0..$n {
+                //     self.bus_log.push((None, None, BusAccessType::Wait));
+                // }
+            };
+            ($n:expr, sync) => {
+                // for _ in 0..$n {
+                //     self.bus_log
+                //         .push((Some(self.regs.pc), None, BusAccessType::Read));
+                // }
+            };
+        }
+
         macro_rules! elapse {
-            (ram, $n:expr) => {
+            (ram, $n:expr $(, $sync:tt)?) => {{
+                bus_log!($n $(, $sync)*);
                 self.counter += self.ioregs.ram_wait_cycle * $n
-            };
-            (io, $n:expr) => {
+            }};
+            (io, $n:expr $(, $sync:tt)?) => {{
+                bus_log!($n $(, $sync)*);
                 self.counter += self.ioregs.io_wait_cycle * $n
-            };
+            }};
         }
 
         macro_rules! addr {
@@ -463,38 +561,46 @@ impl Spc {
                 ((self.regs.psw.p() as u16) << 8) | self.fetch8() as u16
             };
             (zpx) => {{
+                let addr = ((self.regs.psw.p() as u16) << 8)
+                    | self.fetch8().wrapping_add(self.regs.x) as u16;
                 elapse!(io, 1);
-                ((self.regs.psw.p() as u16) << 8) | self.fetch8().wrapping_add(self.regs.x) as u16
+                addr
             }};
             (zpy) => {{
+                let addr = ((self.regs.psw.p() as u16) << 8)
+                    | self.fetch8().wrapping_add(self.regs.y) as u16;
                 elapse!(io, 1);
-                ((self.regs.psw.p() as u16) << 8) | self.fetch8().wrapping_add(self.regs.y) as u16
+                addr
             }};
             ((x)) => {{
-                elapse!(ram, 1);
+                elapse!(ram, 1, sync);
+                addr!((x), false)
+            }};
+            ((x), false) => {{
                 ((self.regs.psw.p() as u16) << 8) | self.regs.x as u16
             }};
             ((x+1)) => {{
-                elapse!(ram, 1);
-                elapse!(io, 1);
+                elapse!(ram, 1, sync);
                 let addr = ((self.regs.psw.p() as u16) << 8) | self.regs.x as u16;
                 self.regs.x = self.regs.x.wrapping_add(1);
                 addr
             }};
             ((y)) => {{
-                elapse!(ram, 1);
+                elapse!(ram, 1, sync);
                 ((self.regs.psw.p() as u16) << 8) | self.regs.y as u16
             }};
             (abs) => {
                 self.fetch16()
             };
             (abx) => {{
+                let addr = addr!(abs).wrapping_add(self.regs.x as u16);
                 elapse!(io, 1);
-                addr!(abs).wrapping_add(self.regs.x as u16)
+                addr
             }};
             (aby) => {{
+                let addr = addr!(abs).wrapping_add(self.regs.y as u16);
                 elapse!(io, 1);
-                addr!(abs).wrapping_add(self.regs.y as u16)
+                addr
             }};
             (abi) => {{
                 let abs = addr!(abs);
@@ -506,11 +612,19 @@ impl Spc {
             }};
             (ziy) => {{
                 let zp = addr!(zp);
-                self.read16(zp).wrapping_add(self.regs.y as u16)
+                elapse!(io, 1);
+                let addr = self.read16_no_wrap(zp).wrapping_add(self.regs.y as u16);
+                addr
+            }};
+            (ziy, store) => {{
+                let zp = addr!(zp);
+                let addr = self.read16_no_wrap(zp).wrapping_add(self.regs.y as u16);
+                elapse!(io, 1);
+                addr
             }};
             (zxi) => {{
                 let zpx = addr!(zpx);
-                self.read16(zpx)
+                self.read16_no_wrap(zpx)
             }};
             (dest) => {{
                 let dest = self.fetch8() as i8 as u16;
@@ -520,10 +634,14 @@ impl Spc {
                 let aaab = self.fetch16();
                 (aaab & 0x01FFF, aaab >> 13)
             }};
+
+            ($addr:tt, $_annot:tt) => {
+                addr!($addr)
+            };
         }
 
         macro_rules! exec_instr {
-            // Annotation
+            // Annotation to register
             ($mne:ident a $(, $op2:tt)?) => {
                 exec_instr!($mne (reg a) $(, $op2)*)
             };
@@ -560,57 +678,76 @@ impl Spc {
                 }
                 set_nz!($dst);
                 self.regs.$dst = v;
-                elapse!(ram, 1);
+                elapse!(ram, 1, sync);
             }};
 
             // Memory Load
             (mov (reg $dst:tt), $src:tt) => {{
                 let addr = addr!($src);
                 let v = self.read8(addr);
+                macro_rules! extra_cycle {
+                    ((x+1)) => {
+                        elapse!(io, 1);
+                    };
+                    ($_:tt) => {};
+                }
+                extra_cycle!($src);
                 self.regs.set_nz(v);
                 self.regs.$dst = v;
             }};
             (movw ya, zp) => {{
                 let addr = addr!(zp);
-                let v = self.read16(addr);
+                let lo = self.read8(addr);
+                elapse!(io, 1);
+                let hi = self.read8(Wrap8Addr(addr).offset(1).0);
+                let v = (hi as u16) << 8 | lo as u16;
                 self.regs.set_nz16(v);
                 self.regs.set_ya(v);
-                elapse!(io, 1);
             }};
 
             // Memory Store
             (mov $dst:tt, $src:tt) => {{
                 let v = rd!($src);
-                let addr = addr!($dst);
+                let addr = addr!($dst, store);
                 macro_rules! dummy_read {
                     (zp, zp) => {};
-                    ((x + 1), a) => {};
+                    ((x+1), (reg a)) => {};
                     ($_d:tt, $_s:tt) => {
                         let _ = self.read8(addr);
                     };
                 }
                 dummy_read!($dst, $src);
+
+                macro_rules! extra_cycle {
+                    ((x+1)) => {
+                        elapse!(io, 1);
+                    };
+                    ($_:tt) => {};
+                }
+                extra_cycle!($dst);
+
                 self.write8(addr, v);
             }};
 
             (movw zp, ya) => {{
                 let addr = addr!(zp);
                 let _ = self.read8(addr); // dummy read lsb
-                self.write16(addr, self.regs.ya());
+                self.write8(addr, self.regs.a);
+                self.write8(Wrap8Addr(addr).offset(1).0, self.regs.y);
             }};
 
             // Push/Pop
             (push $reg:tt) => {{
                 let v = rd!($reg);
+                elapse!(ram, 1, sync);
                 self.push8(v);
-                elapse!(ram, 1);
                 elapse!(io, 1);
             }};
             (pop $reg:tt) => {{
+                elapse!(ram, 1, sync);
+                elapse!(io, 1);
                 let v = self.pop8();
                 wr!($reg, v);
-                elapse!(ram, 1);
-                elapse!(io, 1);
             }};
 
             // 8bit ALU Operations
@@ -656,7 +793,10 @@ impl Spc {
             // 16bit ALU Operations
             (addw ya, zp) => {{
                 let addr = addr!(zp);
-                let op2 = self.read16(addr) as u32;
+                let op2lo = self.read8(addr) as u32;
+                elapse!(io, 1);
+                let op2hi = self.read8(Wrap8Addr(addr).offset(1).0) as u32;
+                let op2 = (op2hi << 8) | op2lo;
                 let op1 = self.regs.ya() as u32;
                 let v = op1 + op2;
                 self.regs.psw.set_z(v as u16 == 0);
@@ -666,25 +806,26 @@ impl Spc {
                 let h = (op1 & 0xFFF) + (op2 & 0xFFF);
                 self.regs.psw.set_h(h > 0xFFF);
                 self.regs.set_ya(v as u16);
-                elapse!(io, 1);
             }};
             (subw ya, zp) => {{
                 let addr = addr!(zp);
-                let op2 = self.read16(addr) as u32;
+                let op2lo = self.read8(addr) as u32;
+                elapse!(io, 1);
+                let op2hi = self.read8(Wrap8Addr(addr).offset(1).0) as u32;
+                let op2 = (op2hi << 8) | op2lo;
                 let op1 = self.regs.ya() as u32;
                 let v = op1.wrapping_sub(op2);
                 self.regs.psw.set_z(v as u16 == 0);
                 self.regs.psw.set_n(v & 0x8000 != 0);
                 self.regs.psw.set_c(!(v > 0xFFFF));
-                self.regs.psw.set_v((op1 ^ op2) & (op1 ^ v & 0x8000) != 0);
+                self.regs.psw.set_v((op1 ^ op2) & (op1 ^ v) & 0x8000 != 0);
                 let h = (op1 & 0xFFF).wrapping_sub(op2 & 0xFFF);
                 self.regs.psw.set_h(!(h > 0xFFF));
                 self.regs.set_ya(v as u16);
-                elapse!(io, 1);
             }};
             (cmpw ya, zp) => {{
                 let addr = addr!(zp);
-                let op2 = self.read16(addr);
+                let op2 = self.read16_no_wrap(addr);
                 let op1 = self.regs.ya();
                 let (val, c) = op1.overflowing_sub(op2);
                 self.regs.set_nz16(val);
@@ -692,19 +833,28 @@ impl Spc {
             }};
             (incw zp) => {{
                 let addr = addr!(zp);
-                let op = self.read16(addr);
+                let lo = self.read8(addr);
+                self.write8(addr, lo.wrapping_add(1));
+                let addr = Wrap8Addr(addr).offset(1).0;
+                let hi = self.read8(addr);
+                let op = (hi as u16) << 8 | lo as u16;
                 let val = op.wrapping_add(1);
                 self.regs.set_nz16(val);
-                self.write16(addr, val);
+                self.write8(addr, (val >> 8) as u8);
             }};
             (decw zp) => {{
                 let addr = addr!(zp);
-                let op = self.read16(addr);
+                let lo = self.read8(addr);
+                self.write8(addr, lo.wrapping_sub(1));
+                let addr = Wrap8Addr(addr).offset(1).0;
+                let hi = self.read8(addr);
+                let op = (hi as u16) << 8 | lo as u16;
                 let val = op.wrapping_sub(1);
                 self.regs.set_nz16(val);
-                self.write16(addr, val);
+                self.write8(addr, (val >> 8) as u8);
             }};
             (div ya, (reg x)) => {{
+                elapse!(ram, 1, sync);
                 let ya = self.regs.ya();
                 if self.regs.x > 0 {
                     let d = ya / self.regs.x as u16;
@@ -722,14 +872,13 @@ impl Spc {
                     self.regs.psw.set_n(true);
                     self.regs.psw.set_v(true);
                 }
-                elapse!(ram, 1);
                 elapse!(io, 10);
             }};
             (mul ya) => {{
                 let val = self.regs.y as u16 * self.regs.a as u16;
-                self.regs.set_nz16(val);
                 self.regs.set_ya(val);
-                elapse!(ram, 1);
+                self.regs.set_nz(self.regs.y); // NZ on Y only
+                elapse!(ram, 1, sync);
                 elapse!(io, 7);
             }};
 
@@ -739,29 +888,25 @@ impl Spc {
                 let op = self.read8(addr);
                 let val = op & !(1 << $i);
                 self.write8(addr, val);
-                elapse!(ram, 1);
             }};
             (set1 zp, $i:expr) => {{
                 let addr = addr!(zp);
                 let op = self.read8(addr);
                 let val = op | (1 << $i);
                 self.write8(addr, val);
-                elapse!(ram, 1);
             }};
             (not1 aaab) => {{
                 let (addr, b) = addr!(aaab);
                 let op = self.read8(addr);
                 let val = op ^ (1 << b);
                 self.write8(addr, val);
-                elapse!(ram, 1);
             }};
             (mov1 aaab, c) => {{
                 let (addr, b) = addr!(aaab);
                 let op = self.read8(addr);
                 let val = op & !(1 << b) | ((self.regs.psw.c() as u8) << b);
-                self.write8(addr, val);
-                elapse!(ram, 1);
                 elapse!(io, 1);
+                self.write8(addr, val);
             }};
             (mov1 c, aaab) => {{
                 let (addr, b) = addr!(aaab);
@@ -798,20 +943,21 @@ impl Spc {
             }};
             (clr c) => {{
                 self.regs.psw.set_c(false);
-                elapse!(ram, 1);
+                elapse!(ram, 1, sync);
             }};
             (set c) => {{
                 self.regs.psw.set_c(true);
-                elapse!(ram, 1);
+                elapse!(ram, 1, sync);
             }};
             (not c) => {{
                 self.regs.psw.set_c(!self.regs.psw.c());
+                elapse!(ram, 1, sync);
                 elapse!(io, 1);
             }};
             (clr v) => {{
                 self.regs.psw.set_v(false);
                 self.regs.psw.set_h(false);
-                elapse!(ram, 1);
+                elapse!(ram, 1, sync);
             }};
 
             // Special ALU Operations
@@ -828,7 +974,7 @@ impl Spc {
                     self.regs.psw.set_c(true);
                 }
                 self.regs.set_nz(self.regs.a);
-                elapse!(ram, 1);
+                elapse!(ram, 1, sync);
                 elapse!(io, 1);
             }};
             (das (reg a)) => {{
@@ -841,29 +987,29 @@ impl Spc {
                     self.regs.psw.set_c(false);
                 }
                 self.regs.set_nz(self.regs.a);
-                elapse!(ram, 1);
+                elapse!(ram, 1, sync);
                 elapse!(io, 1);
             }};
             (xcn (reg a)) => {{
                 let v = self.regs.a.rotate_right(4);
                 self.regs.set_nz(v);
                 self.regs.a = v;
-                elapse!(ram, 1);
+                elapse!(ram, 1, sync);
                 elapse!(io, 3);
             }};
             (tclr abs, (reg a)) => {{
                 let addr = addr!(abs);
                 let v = self.read8(addr);
-                self.regs.set_nz(v ^ self.regs.a);
+                let _ = self.read8(addr); // FIXME: read twice?
+                self.regs.set_nz(self.regs.a.wrapping_sub(v));
                 self.write8(addr, v & !self.regs.a);
-                elapse!(ram, 1);
             }};
             (tset abs, (reg a)) => {{
                 let addr = addr!(abs);
                 let v = self.read8(addr);
-                self.regs.set_nz(v ^ self.regs.a);
+                let _ = self.read8(addr); // FIXME: read twice?
+                self.regs.set_nz(self.regs.a.wrapping_sub(v));
                 self.write8(addr, v | self.regs.a);
-                elapse!(ram, 1);
             }};
 
             // Conditional Jumps
@@ -893,9 +1039,9 @@ impl Spc {
             };
             (bbs zp.$i:expr, dest) => {{
                 let addr = addr!(zp);
-                let dest = addr!(dest);
                 let v = self.read8(addr);
                 elapse!(io, 1);
+                let dest = addr!(dest);
                 if v & (1 << $i) != 0 {
                     self.regs.pc = dest;
                     elapse!(ram, 2);
@@ -904,8 +1050,8 @@ impl Spc {
             (bbc zp.$i:expr, dest) => {{
                 let addr = addr!(zp);
                 let dest = addr!(dest);
-                let v = self.read8(addr);
                 elapse!(io, 1);
+                let v = self.read8(addr);
                 if v & (1 << $i) == 0 {
                     self.regs.pc = dest;
                     elapse!(io, 2);
@@ -921,10 +1067,10 @@ impl Spc {
                 }
             }};
             (dbnz (reg y), dest) => {{
-                let dest = addr!(dest);
-                self.regs.y = self.regs.y.wrapping_sub(1);
-                elapse!(ram, 1);
+                elapse!(ram, 1, sync);
                 elapse!(io, 1);
+                self.regs.y = self.regs.y.wrapping_sub(1);
+                let dest = addr!(dest);
                 if self.regs.y != 0 {
                     self.regs.pc = dest;
                     elapse!(io, 2);
@@ -932,10 +1078,9 @@ impl Spc {
             }};
             (dbnz zp, dest) => {{
                 let addr = addr!(zp);
-                let dest = addr!(dest);
                 let v = self.read8(addr).wrapping_sub(1);
                 self.write8(addr, v);
-                elapse!(io, 1);
+                let dest = addr!(dest);
                 if v != 0 {
                     self.regs.pc = dest;
                     elapse!(io, 2);
@@ -952,67 +1097,77 @@ impl Spc {
             };
             (call $addrmode:tt) => {{
                 let addr = addr!($addrmode);
+                elapse!(io, 1);
                 self.push16(self.regs.pc);
                 self.regs.pc = addr;
-                elapse!(io, 3);
+                elapse!(io, 2);
             }};
             (tcall $i:expr) => {{
+                elapse!(io, 1, sync);
+                elapse!(io, 1);
                 self.push16(self.regs.pc);
+                elapse!(io, 1);
                 self.regs.pc = self.read16(0xFFDE - (2 * $i));
-                elapse!(io, 3);
             }};
             (pcall imm) => {{
                 let n = self.fetch8();
+                elapse!(io, 1);
                 self.push16(self.regs.pc);
                 self.regs.pc = 0xFF00 | n as u16;
-                elapse!(io, 3);
+                elapse!(io, 1);
             }};
             (ret) => {{
-                self.regs.pc = self.pop16();
-                elapse!(ram, 1);
+                elapse!(ram, 1, sync);
                 elapse!(io, 1);
+                self.regs.pc = self.pop16();
             }};
             (reti) => {{
+                elapse!(ram, 1, sync);
+                elapse!(io, 1);
                 self.regs.psw = self.pop8().into();
                 self.regs.pc = self.pop16();
-                elapse!(ram, 1);
-                elapse!(io, 1);
             }};
             (brk) => {{
+                elapse!(io, 1, sync);
                 self.push16(self.regs.pc);
                 self.push8(self.regs.psw.into());
                 self.regs.psw.set_i(false);
                 self.regs.psw.set_b(true);
+                elapse!(io, 1);
                 self.regs.pc = self.read16(0xFFDE);
-                elapse!(io, 2);
             }};
 
             // Wait/Delay/Control
             (nop) => {
-                elapse!(ram, 1)
+                elapse!(ram, 1, sync)
             };
-            (sleep) => {
-                panic!("sleep")
-            };
-            (stop) => {
-                panic!("stop")
-            };
+            (sleep) => {{
+                elapse!(ram, 1, sync);
+                elapse!(io, 1);
+                self.sleep = true;
+                panic!("sleep");
+            }};
+            (stop) => {{
+                elapse!(io, 1);
+                self.stop = true;
+                panic!("stop");
+            }};
             (clr p) => {{
                 self.regs.psw.set_p(false);
-                elapse!(ram, 1);
+                elapse!(ram, 1, sync);
             }};
             (set p) => {{
                 self.regs.psw.set_p(true);
-                elapse!(ram, 1);
+                elapse!(ram, 1, sync);
             }};
             (ei) => {{
                 self.regs.psw.set_i(true);
-                elapse!(ram, 1);
+                elapse!(ram, 1, sync);
                 elapse!(io, 1);
             }};
             (di) => {{
                 self.regs.psw.set_i(false);
-                elapse!(ram, 1);
+                elapse!(ram, 1, sync);
                 elapse!(io, 1);
             }};
         }
@@ -1023,52 +1178,42 @@ impl Spc {
                 let op2 = rd!($op2);
                 macro_rules! exec {
                     (true) => {
-                        rmw_exec!($op1, alu_op, $op, op2)
+                        rmw!($op1, alu_op, $op, op2)
                     };
                     (false) => {{
-                        let op1 = rd!($op1);
+                        let op1 = rd!($op1, false);
                         alu_op!($op, op1, op2)
                     }};
                 }
                 exec!($wb);
+
                 macro_rules! extra_cycle {
-                    ((reg $_:ident), $_2:tt) => {};
-                    ($_1:tt, $_2:tt) => {
+                    ((reg $_:ident), $_2:tt, $_wb:tt) => {};
+                    ($_1:tt, $_2:tt, false) => {
                         elapse!(io, 1);
                     };
+                    ($_1:tt, $_2:tt, true) => {};
                 }
-                extra_cycle!($op1, $op2);
+                extra_cycle!($op1, $op2, $wb);
             }};
         }
 
         macro_rules! rmw {
-            ($opr:tt, $m:ident, $op:tt) => {{
-                rmw_exec!($opr, $m, $op);
-                // zp, abs: IOx1, reg, zpx: RAMx1
-                macro_rules! rmw_extra_cycle {
-                    (zp) => {
-                        elapse!(io, 1)
-                    };
-                    (abs) => {
-                        elapse!(io, 1)
-                    };
-                    ($_:tt) => {
-                        elapse!(ram, 1)
-                    };
-                }
-                rmw_extra_cycle!($opr);
-            }};
-        }
-
-        macro_rules! rmw_exec {
-            ((reg $reg:ident), $m:ident, $op:ident $(, $op2:expr)*) => {{
+            ((reg $reg:ident), $m:ident, $op:ident) => {{
                 let op1 = self.regs.$reg;
-                let v = $m!($op, op1 $(, $op2)*);
+                let v = $m!($op, op1);
+                self.regs.$reg = v;
+                elapse!(ram, 1, sync);
+            }};
+
+            ((reg $reg:ident), $m:ident, $op:ident, $op2:expr) => {{
+                let op1 = self.regs.$reg;
+                let v = $m!($op, op1, $op2);
                 self.regs.$reg = v;
             }};
 
             ($addrmode:tt, $m:ident, $op:ident $(, $op2:expr)*) => {{
-                let addr = addr!($addrmode);
+                let addr = addr!($addrmode, false);
                 let op1 = self.read8(addr);
                 let v = $m!($op, op1 $(, $op2)*);
                 self.write8(addr, v);
@@ -1185,14 +1330,14 @@ impl Spc {
 
         #[rustfmt::skip]
         macro_rules! rd {
-            ((reg a)) => { self.regs.a };
-            ((reg x)) => { self.regs.x };
-            ((reg y)) => { self.regs.y };
-            ((reg sp)) => { self.regs.sp };
+            ((reg a) $(, $_first:tt)?) => { self.regs.a };
+            ((reg x) $(, $_first:tt)?) => { self.regs.x };
+            ((reg y) $(, $_first:tt)?) => { self.regs.y };
+            ((reg sp) $(, $_first:tt)?) => { self.regs.sp };
             (psw) => { self.regs.psw.into() };
 
-            ($addrmode:tt) => {{
-                let addr = addr!($addrmode);
+            ($addrmode:tt $(, $first:tt)?) => {{
+                let addr = addr!($addrmode $(, $first)*);
                 self.read8(addr)
             }};
         }
@@ -1443,6 +1588,9 @@ impl SpcFile {
             },
             ioregs: IORegisters::default(),
             dsp: Dsp::default(),
+            sleep: false,
+            stop: false,
+            bus_log: vec![],
             counter: 0,
             dsp_counter: 0,
         };
