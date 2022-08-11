@@ -12,6 +12,7 @@ super-sabicom-macro = { path = "super-sabicom-macro", version = "0.1" }
 anyhow = "1.0.58"
 educe = { version = "0.4.19", features = ["Default"], default-features = false }
 egui = "0.18.1"
+encoding_rs = "0.8.31"
 log = "0.4.17"
 meru-interface = { version = "0.2.0", path = "../meru/meru-interface" }
 modular-bitfield = "0.11.2"
@@ -21,7 +22,7 @@ thiserror = "1.0.31"
 [dev-dependencies]
 anyhow = "1.0.58"
 argopt = "0.3.0"
-compress-tools = "0.12.3"
+compress-tools = "0.13"
 dirs = "4.0.0"
 env_logger = "0.9.0"
 rayon = "1.5.3"

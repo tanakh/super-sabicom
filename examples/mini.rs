@@ -108,12 +108,24 @@ fn save_backup(rom_path: &Path, backup: Vec<u8>) -> Result<()> {
 }
 
 fn print_game_info(snes: &Snes) {
+    use super_sabicom::context::Cartridge;
+
     let game_info = snes.game_info();
 
     let field_len = game_info.iter().map(|r| r.0.len()).max().unwrap();
 
     for (desc, value) in snes.game_info() {
         println!("{desc:field_len$}: {value}");
+    }
+
+    let cart = snes.ctx.cartridge();
+    let errors = &cart.rom().header.errors;
+
+    if !errors.is_empty() {
+        println!("Errors:");
+        for e in errors {
+            println!("  * {}", e);
+        }
     }
 }
 

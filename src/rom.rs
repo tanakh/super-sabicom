@@ -1,11 +1,14 @@
 use std::fmt::Display;
 
-use log::warn;
 use thiserror::Error;
 
-#[derive(Debug)]
 pub struct Rom {
-    pub title: Vec<u8>,
+    pub header: Header,
+    pub rom: Vec<u8>,
+}
+
+pub struct Header {
+    pub title: String,
     pub speed: Speed,
     pub map_mode: MapMode,
     pub chipset: Chipset,
@@ -17,7 +20,13 @@ pub struct Rom {
     pub rom_version: u8,
     pub checksum: u16,
     pub checksum_correct: bool,
-    pub rom: Vec<u8>,
+    pub errors: Vec<RomError>,
+}
+
+impl Header {
+    fn score(&self) -> u32 {
+        self.errors.iter().map(|e| e.score()).sum()
+    }
 }
 
 #[derive(Debug)]
@@ -219,14 +228,42 @@ pub enum RomError {
     InvalidRomSize,
     #[error("invalid title string")]
     InvalidTitleString,
+    #[error("invalid speed: {0:02X}")]
+    InvalidSpeed(u8),
+    #[error("invalid map mode: {0:02X}")]
+    InvalidMapMode(u8),
+    #[error("invalid chipset code: {0:02X} (sub: {1:02X})")]
+    InvalidChipset(u8, u8),
     #[error("invalid rom size code: {0}")]
     InvalidRomSizeCode(u8),
+    #[error("rom size does not match")]
+    RomSizeDoesNotMatch,
     #[error("invalid sram size code: {0}")]
     InvalidSramSizeCode(u8),
     #[error("invalid checksum: {0:04X} (complement: {1:04X})")]
+    InvalidChecksumComplement(u16, u16),
+    #[error("invalid checksum: {0:04X} (actual: {1:04X})")]
     InvalidChecksum(u16, u16),
     #[error("unknown rom type")]
     UnknownRomType,
+}
+
+impl RomError {
+    fn score(&self) -> u32 {
+        match self {
+            RomError::InvalidRomSize => 10000,
+            RomError::InvalidTitleString => 1,
+            RomError::InvalidSpeed(_) => 100,
+            RomError::InvalidMapMode(_) => 10,
+            RomError::InvalidChipset(_, _) => 100,
+            RomError::InvalidRomSizeCode(_) => 100,
+            RomError::RomSizeDoesNotMatch => 10,
+            RomError::InvalidSramSizeCode(_) => 100,
+            RomError::InvalidChecksumComplement(_, _) => 10,
+            RomError::InvalidChecksum(_, _) => 1,
+            RomError::UnknownRomType => 10000,
+        }
+    }
 }
 
 impl Rom {
@@ -239,103 +276,115 @@ impl Rom {
             Err(RomError::InvalidRomSize)?
         };
 
-        let (header_pos_first, rom) = if let Ok(rom) = try_from_bytes(bytes, 0x7F00, true) {
-            (true, rom)
-        } else if let Ok(rom) = try_from_bytes(bytes, 0xFF00, true) {
-            (false, rom)
-        } else if let Ok(rom) = try_from_bytes(bytes, 0x7F00, false) {
-            (true, rom)
+        let mut candidates = vec![];
+
+        if let Ok(header) = try_parse_header(bytes, 0x7F00) {
+            candidates.push((true, header));
+        }
+        if let Ok(header) = try_parse_header(bytes, 0xFF00) {
+            candidates.push((false, header));
+        }
+        if let Ok(header) = try_parse_header(bytes, 0x40FF00) {
+            candidates.push((false, header));
+        }
+
+        if candidates.is_empty() {
+            Err(RomError::UnknownRomType)?
+        }
+
+        for (_, c) in &candidates {
+            log::warn!("Cand: score: {:?}, errors: {:?}", c.score(), c.errors);
+        }
+
+        let (header_pos_first, header) = candidates
+            .into_iter()
+            .min_by_key(|(_, r)| r.score())
+            .unwrap();
+
+        let interleaved = if header_pos_first {
+            match header.map_mode {
+                MapMode::LoRom => false,
+                _ => true,
+            }
         } else {
-            (false, try_from_bytes(bytes, 0xFF00, false)?)
+            match header.map_mode {
+                MapMode::HiRom | MapMode::ExHiRom => false,
+                _ => true,
+            }
         };
 
-        if header_pos_first != matches!(rom.map_mode, MapMode::LoRom) {
+        if interleaved {
             // FIXME: More accurate detection
             // Maybe interleaved
             todo!("Interleaved ROM image suport");
         }
 
-        Ok(rom)
+        Ok(Rom {
+            header,
+            rom: bytes.to_vec(),
+        })
     }
 }
 
-fn try_from_bytes(bytes: &[u8], header_pos: usize, strict: bool) -> Result<Rom, RomError> {
+fn try_parse_header(bytes: &[u8], header_pos: usize) -> Result<Header, RomError> {
     if header_pos + 0x100 > bytes.len() {
         Err(RomError::UnknownRomType)?
     }
+
+    let mut errors = vec![];
+
     let header = &bytes[header_pos..header_pos + 0x100];
 
     let title = header[0xC0..=0xD4].to_vec();
-    eprintln!("{:?}", String::from_utf8_lossy(&title));
-    if !title
-        .iter()
-        .all(|&b| b.is_ascii_alphanumeric() || b.is_ascii_punctuation() || b == b' ')
-    {
-        if strict {
-            Err(RomError::InvalidTitleString)?
-        } else {
-            warn!(
-                "Invalid title string: {:?}",
-                String::from_utf8_lossy(&title)
-            );
-        }
+
+    let (title, _, invalid) = encoding_rs::SHIFT_JIS.decode(&title);
+    if invalid {
+        errors.push(RomError::InvalidTitleString);
     }
 
     let v = header[0xD5];
 
     if v & 0xE0 != 0x20 {
-        warn!(
-            "Invalid data in header at {:#06X}: {v:#04X}",
-            header_pos + 0xD5,
-        );
+        errors.push(RomError::InvalidSpeed(v));
     }
 
     let speed = Speed::from((v >> 4) & 1);
     let map_mode = MapMode::from(v & 0xF);
 
-    let chipset = parse_chipset(header[0xD6], header[0xBF]);
+    if matches!(map_mode, MapMode::Unknown(_)) {
+        errors.push(RomError::InvalidMapMode(v));
+    }
+
+    let chipset_code = header[0xD6];
+    let chipset_code_sub = header[0xBF];
+    let chipset = parse_chipset(chipset_code, chipset_code_sub);
 
     if !chipset.is_valid {
-        warn!(
-            "Invalid chipset: code={:#04X}, subclass={:#04X}",
-            header[0xD6], header[0xBF]
-        );
+        errors.push(RomError::InvalidChipset(chipset_code, chipset_code_sub));
     }
 
     let rom_size_code = header[0xD7];
-    if rom_size_code >= 0xD {
-        warn!("Invalid rom size code: {rom_size_code:X}");
-        Err(RomError::InvalidRomSizeCode(rom_size_code))?;
+    if rom_size_code > 0xD {
+        errors.push(RomError::InvalidRomSizeCode(rom_size_code));
     }
 
     let rom_size = (1 << rom_size_code) * 1024;
-    if !(rom_size / 2 + 1..=rom_size).contains(&bytes.len()) {
-        warn!(
-            "ROM size does not match with headers info: expected: {rom_size}, actual: {}",
-            bytes.len()
-        );
-    }
-
-    if rom_size != bytes.len() {
-        warn!(
-            "Odd sized ROM: expected: {rom_size}({rom_size_code}), actual: {}",
-            bytes.len()
-        );
+    if rom_size != bytes.len().next_power_of_two() {
+        errors.push(RomError::RomSizeDoesNotMatch);
     }
 
     let ram_size_code = header[0xD8];
     if ram_size_code > 9 {
-        warn!("Invalid sram size code: {ram_size_code:X}");
-        Err(RomError::InvalidSramSizeCode(ram_size_code))?;
+        errors.push(RomError::InvalidSramSizeCode(ram_size_code));
     }
 
     let sram_size = if ram_size_code == 0 {
         0
     } else {
         if !chipset.has_ram {
-            Err(RomError::InvalidSramSizeCode(ram_size_code))?;
+            errors.push(RomError::InvalidSramSizeCode(ram_size_code));
         }
-        1 << (10 + ram_size_code as u32)
+        (1 << ram_size_code as u32) * 1024
     };
 
     let country = header[0xD9];
@@ -350,23 +399,18 @@ fn try_from_bytes(bytes: &[u8], header_pos: usize, strict: bool) -> Result<Rom, 
 
     let rom_version = header[0xD8];
 
-    // TODO: test checksum
-
     let checksum_comp = u16::from_le_bytes(header[0xDC..0xDE].try_into().unwrap());
     let checksum = u16::from_le_bytes(header[0xDE..0xE0].try_into().unwrap());
 
     if checksum_comp != !checksum {
-        // if strict {
-        warn!("Checksum complement is not complement of checksum: {checksum_comp:04X}^0xFFFF != {checksum:04X}");
-        Err(RomError::InvalidChecksum(checksum, checksum_comp))?;
-        // }
+        errors.push(RomError::InvalidChecksumComplement(checksum, checksum_comp));
     }
 
     let mut actual_sum = 0_u16;
     for i in 0..bytes.len() {
-        let b = if (0xDC..0xDE).contains(&i) {
+        let b = if (header_pos + 0xDC..header_pos + 0xDE).contains(&i) {
             0xFF
-        } else if (0xDE..0xE0).contains(&i) {
+        } else if (header_pos + 0xDE..header_pos + 0xE0).contains(&i) {
             0
         } else {
             bytes[i]
@@ -377,11 +421,11 @@ fn try_from_bytes(bytes: &[u8], header_pos: usize, strict: bool) -> Result<Rom, 
     let checksum_correct = actual_sum == checksum;
 
     if !checksum_correct {
-        warn!("Checksum incorrect: expected: {checksum:04X}, actual: {actual_sum:04X}");
+        errors.push(RomError::InvalidChecksum(checksum, actual_sum));
     }
 
-    Ok(Rom {
-        title,
+    Ok(Header {
+        title: title.to_string(),
         speed,
         map_mode,
         chipset,
@@ -393,51 +437,6 @@ fn try_from_bytes(bytes: &[u8], header_pos: usize, strict: bool) -> Result<Rom, 
         rom_version,
         checksum,
         checksum_correct,
-        rom: bytes.to_vec(),
+        errors,
     })
-}
-
-fn is_lorom(bytes: &[u8]) -> bool {
-    if bytes.len() < 0x8000 {
-        return false;
-    }
-    test_checksum(bytes, 0x7FDC)
-}
-
-fn is_hirom(bytes: &[u8]) -> bool {
-    if bytes.len() < 0x10000 {
-        return false;
-    }
-    test_checksum(bytes, 0xFFDC)
-}
-
-fn test_checksum(bytes: &[u8], checksum_offset: usize) -> bool {
-    let checksum_comp = u16::from_le_bytes(
-        bytes[checksum_offset..checksum_offset + 2]
-            .try_into()
-            .unwrap(),
-    );
-    let checksum = u16::from_le_bytes(
-        bytes[checksum_offset + 2..checksum_offset + 4]
-            .try_into()
-            .unwrap(),
-    );
-
-    if checksum != checksum_comp ^ 0xFFFF {
-        return false;
-    }
-
-    let mut sum = 0_u16;
-    for i in 0..bytes.len() {
-        let b = if (checksum_offset..checksum_offset + 2).contains(&i) {
-            0xFF
-        } else if (checksum_offset + 2..checksum_offset + 4).contains(&i) {
-            0
-        } else {
-            bytes[i]
-        };
-        sum = sum.wrapping_add(b as u16);
-    }
-
-    checksum == sum
 }
