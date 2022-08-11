@@ -15,7 +15,6 @@ pub trait Bus {
     fn read(&mut self, addr: u32) -> u8;
     fn read_pure(&self, addr: u32) -> Option<u8>;
     fn write(&mut self, addr: u32, data: u8);
-    fn bus_locked(&self) -> bool;
     fn bus_tick(&mut self);
 }
 
@@ -212,16 +211,7 @@ impl Bus for Inner1 {
     }
 
     fn write(&mut self, addr: u32, data: u8) {
-        // FIXME: hack for sub-instruction cycle accuracy
-        // FIXME: render flag
-        self.ppu_tick(true);
-        self.bus.tick(&mut self.inner);
-
         self.bus.write::<_, 0>(&mut self.inner, addr, data)
-    }
-
-    fn bus_locked(&self) -> bool {
-        self.bus.locked()
     }
 
     fn bus_tick(&mut self) {

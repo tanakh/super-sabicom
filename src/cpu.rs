@@ -19,6 +19,7 @@ pub struct Cpu {
     pub stop: bool,
     pub halt: bool,
     prev_i: bool,
+    prev_counter: u64,
 }
 
 impl Default for Cpu {
@@ -28,6 +29,7 @@ impl Default for Cpu {
             stop: false,
             halt: false,
             prev_i: true,
+            prev_counter: 0,
         }
     }
 }
@@ -475,6 +477,15 @@ impl Cpu {
     }
 
     pub fn exec_one(&mut self, ctx: &mut impl Context) {
+        let prev_i = self.prev_i;
+        self.prev_i = self.regs.p.i();
+
+        self.exec_one_(ctx, prev_i);
+
+        self.prev_counter = ctx.now();
+    }
+
+    pub fn exec_one_(&mut self, ctx: &mut impl Context, prev_i: bool) {
         // FIXME: delete this when stable
         if !self.check_invaliant() {
             self.trace(ctx);
@@ -484,7 +495,7 @@ impl Cpu {
         let prev_i = self.prev_i;
         self.prev_i = self.regs.p.i();
 
-        if ctx.bus_locked() {
+        if self.prev_counter < ctx.now() {
             return;
         }
 

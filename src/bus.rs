@@ -1,4 +1,4 @@
-use log::{debug, error, info, trace, warn};
+use log::{debug, info, trace, warn};
 use modular_bitfield::prelude::*;
 
 use crate::context;
@@ -32,7 +32,6 @@ pub struct Bus {
     hdma_enable: u8,
     dma: [Dma; 8],
 
-    locked: bool,
     gdma_do_transfer: bool,
     controller_port: [ControllerPort; 2],
     open_bus: u8,
@@ -154,7 +153,6 @@ impl Default for Bus {
             gdma_enable: 0,
             hdma_enable: 0,
             dma: Default::default(),
-            locked: false,
             gdma_do_transfer: false,
             controller_port: Default::default(),
             open_bus: 0,
@@ -208,13 +206,8 @@ impl Bus {
         }
     }
 
-    pub fn locked(&self) -> bool {
-        self.locked
-    }
-
     pub fn tick(&mut self, ctx: &mut impl Context) {
-        self.locked = false;
-        self.dma_exec(ctx);
+        self.dma_exec(ctx, true);
     }
 
     pub fn read<C: Context, const DMA: u8>(&mut self, ctx: &mut C, addr: u32) -> u8 {
@@ -442,6 +435,7 @@ impl Bus {
         // Sync PPU counter
         // FIXME: render flag
         ctx.ppu_tick(true);
+        self.dma_exec(ctx, false);
 
         let data = match addr {
             // FIXME: Does PPU open bus affect CPU open bus?
@@ -553,10 +547,10 @@ impl Bus {
     }
 
     fn io_write(&mut self, ctx: &mut impl Context, addr: u16, data: u8) {
-        trace!(
-            "IO Write: {addr:#06X}{} = {data:#04X}",
-            ioreg_info(addr).map_or_else(|| "".to_string(), |info| format!("({})", info.name))
-        );
+        // FIXME: hack for sub-instruction cycle accuracy
+        // FIXME: render flag
+        ctx.ppu_tick(true);
+        self.dma_exec(ctx, false);
 
         match addr {
             0x2100..=0x213F => ctx.ppu_write(addr, data),
@@ -709,7 +703,7 @@ impl Bus {
         }
     }
 
-    fn dma_exec(&mut self, ctx: &mut impl Context) {
+    fn dma_exec(&mut self, ctx: &mut impl Context, exec_gdma: bool) {
         if ctx.ppu_mut().hdma_reload() {
             for ch in 0..8 {
                 self.dma[ch].hdma_done_transfer = false;
@@ -741,7 +735,7 @@ impl Bus {
             }
         }
 
-        if self.gdma_enable != 0 {
+        if exec_gdma && self.gdma_enable != 0 {
             if !self.gdma_do_transfer {
                 // Wait 2~8 master cycle to adjust master cycle to multiple of 8
                 ctx.elapse(8 - (ctx.now() & 7));
@@ -814,7 +808,6 @@ impl Bus {
             ctx.elapse(8);
 
             a_addr = a_addr.wrapping_add(a_inc);
-            self.locked = true;
 
             self.dma[ch].byte_count_or_indirect_hdma_addr = self.dma[ch]
                 .byte_count_or_indirect_hdma_addr
@@ -835,8 +828,6 @@ impl Bus {
         // HDMA cancels same channel' GDMA
         self.dma[ch].gdma_do_transfer = false;
         self.gdma_enable &= !(1 << ch);
-
-        self.locked = true;
 
         self.dma[ch].hdma_cur_addr = self.dma[ch].cur_addr;
 
@@ -905,7 +896,6 @@ impl Bus {
                 }
 
                 ctx.elapse(8);
-                self.locked = true;
             }
         }
 
@@ -924,7 +914,6 @@ impl Bus {
             let data = self.read::<_, DMA_A>(ctx, addr);
             ctx.elapse(8);
             self.dma[ch].hdma_line_counter = data;
-            self.locked = true;
 
             debug!(
                 "HDMA {ch}: New line counter: {:02X}",
