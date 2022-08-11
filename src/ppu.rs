@@ -1312,7 +1312,7 @@ impl Ppu {
                     let v_val = BgOptEntry::from_bytes(self.get_tile(2, bg3_x, bg3_vofs + 8));
                     // if(Hval&ValidBit) HOFS = (HOFS&7) | ((X&~7) + (Hval&~7))
                     let sx = if h_val.apply_to_bg(i) {
-                        (sx & 7) | ((x & !7) + h_val.offset() as u32 & !7) as usize
+                        (sx & 7) | ((x & !7) + (h_val.offset() as u32 & !7)) as usize
                     } else {
                         sx
                     };
@@ -1326,14 +1326,12 @@ impl Ppu {
                 } else if bg_mode == 4 {
                     let bg3_x = ((x.wrapping_sub(8) & !7) + (bg3_hofs as u32 & !7)) as usize;
                     let val = BgOptEntry::from_bytes(self.get_tile(2, bg3_x, bg3_vofs));
-                    // if(Hval&ValidBit) HOFS = (HOFS&7) | ((X&~7) + (Hval&~7))
-                    let sx = if !val.apply_to_v() {
-                        (sx & 7) | ((x & !7) + val.offset() as u32 & !7) as usize
+                    let sx = if !val.apply_to_v() && val.apply_to_bg(i) {
+                        (sx & 7) | ((x & !7) + (val.offset() as u32 & !7)) as usize
                     } else {
                         sx
                     };
-                    // if(Vval&ValidBit) VOFS = Y + Vval
-                    let sy = if val.apply_to_v() {
+                    let sy = if val.apply_to_v() && val.apply_to_bg(i) {
                         y as usize + val.offset() as usize
                     } else {
                         sy
