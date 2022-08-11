@@ -1570,14 +1570,14 @@ impl Ppu {
         let win_disable_main = self.win_disable_main.obj();
         let win_disable_sub = self.win_disable_sub.obj();
 
-        let mut render_obj = 0;
-        let mut render_tiles = 0;
-
         let priority_rot = if self.oam_addr.priority_rotation() {
             (self.oam_addr_internal >> 2) & 0x7F
         } else {
             0
         };
+
+        let mut scanline_objs: [_; 32] = Default::default();
+        let mut scanline_obj_cnt = 0;
 
         for i in 0..0x80 {
             let i = ((i + priority_rot) & 0x7F) as usize;
@@ -1608,11 +1608,41 @@ impl Ppu {
                 continue;
             }
 
-            render_obj += 1;
-            if render_obj > 32 {
+            scanline_objs[scanline_obj_cnt] = Some((entry, ow, oh, ox, dy));
+            scanline_obj_cnt += 1;
+
+            if scanline_obj_cnt >= 32 {
                 self.obj_range_overflow = true;
                 break;
             }
+        }
+
+        let mut render_objs: [_; 32] = Default::default();
+        let mut render_obj_cnt = 0;
+        let mut render_tiles = 0;
+
+        'outer: for i in (0..scanline_obj_cnt).rev() {
+            let (entry, ow, oh, ox, dy) = scanline_objs[i].unwrap();
+
+            render_objs[render_obj_cnt] = Some((entry, ow, oh, ox, dy));
+            render_obj_cnt += 1;
+
+            for bi in 0..ow / 8 {
+                let l = (ox + bi * 8) & 0x1FF;
+                let r = (l + 7) & 0x1FF;
+
+                if l < 256 || r < 256 {
+                    render_tiles += 1;
+                    if render_tiles >= 34 {
+                        self.obj_time_overflow = true;
+                        break 'outer;
+                    }
+                }
+            }
+        }
+
+        for i in (0..render_obj_cnt).rev() {
+            let (entry, ow, oh, ox, dy) = render_objs[i].unwrap();
 
             let pixel_y = if !entry.y_flip() { dy } else { oh - 1 - dy };
 
@@ -1673,13 +1703,6 @@ impl Ppu {
                         }
                     }
                 }
-            }
-
-            // FIXME: Only tiles that have actually been rendered
-            render_tiles += ow / 8;
-            if render_tiles > 34 {
-                self.obj_time_overflow = true;
-                break;
             }
         }
     }
