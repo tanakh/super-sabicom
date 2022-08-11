@@ -79,6 +79,7 @@ pub struct InterruptCtrl {
     nmi_enable: bool,
     nmi_flag: bool,
     nmi: bool,
+    nmi_raise: bool,
     hvirq_enable: u8,
     h_count: u16,
     v_count: u16,
@@ -99,7 +100,7 @@ impl InterruptCtrl {
         let prev = self.nmi_enable && self.nmi_flag;
         self.nmi_enable = enable;
         if !prev && self.nmi_enable && self.nmi_flag {
-            self.nmi = true;
+            self.nmi_raise = true;
         }
     }
 
@@ -113,13 +114,14 @@ impl InterruptCtrl {
         let prev = self.nmi_enable && self.nmi_flag;
         self.nmi_flag = nmi;
         if self.nmi_enable && !prev && self.nmi_flag {
-            self.nmi = true;
+            self.nmi_raise = true;
         }
     }
 
     pub fn nmi(&mut self) -> bool {
         let ret = self.nmi;
-        self.nmi = false;
+        self.nmi = self.nmi_raise;
+        self.nmi_raise = false;
         ret
     }
 
