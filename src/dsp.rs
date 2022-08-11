@@ -131,6 +131,7 @@ impl Voice {
             self.key_on = false;
             self.cur_envelope = 0;
             self.envelope_counter = 0;
+            self.gauss_old.fill(0); // FIXME: is this correct?
             self.state = EnvelopeState::Attack;
             self.brr_start(ram, sample_table_addr, false);
         }
@@ -275,7 +276,6 @@ impl Voice {
         } else {
             u16::from_le_bytes(ram[addr + 2..addr + 4].try_into().unwrap())
         };
-        // self.brr_pitch_counter = 0;
         debug!(
             "Start BRR decode: entry = {addr:04X}, addr = {:04X}",
             self.brr_cur_addr,
