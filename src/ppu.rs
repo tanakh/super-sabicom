@@ -1706,16 +1706,39 @@ impl Ppu {
     }
 
     fn color_math(&mut self) {
-        if self.bg_mode.hires() {
-            self.color_math_hires();
-            return;
-        }
-
         let win_calc = self.win_calc_math();
         let master_brightness = self.display_ctrl.master_brightness();
         let sub_screen_enable = self.color_math_ctrl.sub_screen_enable();
+        let hires = self.bg_mode.hires();
+        let black = Rgb555::from(0);
+
+        let fb_y = (self.y as usize - 1) * 2;
+
+        let blend = |main: Rgb555,
+                     force_main_black: bool,
+                     sub: Rgb555,
+                     sub_is_transparent: bool|
+         -> Rgb555 {
+            let half_color =
+                !force_main_black && !sub_is_transparent && self.color_math_ctrl.color_math_half();
+
+            if self.color_math_ctrl.color_math_subtract() {
+                if half_color {
+                    main.blend::<false, true>(sub)
+                } else {
+                    main.blend::<false, false>(sub)
+                }
+            } else {
+                if half_color {
+                    main.blend::<true, true>(sub)
+                } else {
+                    main.blend::<true, false>(sub)
+                }
+            }
+        };
 
         for x in 0..SCREEN_WIDTH {
+            let fb_x = x as usize * 2;
             let in_win = win_calc.contains(x);
 
             let force_main_black = match self.color_math_ctrl.force_main_screen_black() {
@@ -1731,85 +1754,83 @@ impl Ppu {
                 self.line_buffer_main[x as usize]
             });
 
-            let sub = Rgb555::from(if sub_screen_enable {
-                self.line_buffer_sub[x as usize]
+            let (sub, sub_is_transparent) = if sub_screen_enable {
+                (
+                    Rgb555::from(self.line_buffer_sub[x as usize]),
+                    self.attr_buffer_sub[x as usize].kind() == PIXEL_KIND_BACKDROP,
+                )
             } else {
-                self.sub_backdrop.into()
-            });
+                (self.sub_backdrop.clone(), false)
+            };
 
-            let enable = match self.color_math_ctrl.color_math_enable() {
+            let win_enable = match self.color_math_ctrl.color_math_enable() {
                 ColorMathEnable::Always => true,
                 ColorMathEnable::MathWindow => in_win,
                 ColorMathEnable::NotMathWindow => !in_win,
                 ColorMathEnable::Never => false,
             };
 
-            let enable = enable && {
+            let enable = win_enable && {
                 let pixel_kind = self.attr_buffer_main[x as usize].kind();
                 self.color_math_ctrl.color_math_enable_kind() & (1 << pixel_kind) != 0
             };
 
-            let sub_is_transparent =
-                sub_screen_enable && self.attr_buffer_sub[x as usize].kind() == PIXEL_KIND_BACKDROP;
-
-            let half_color =
-                !force_main_black && !sub_is_transparent && self.color_math_ctrl.color_math_half();
-
             let result = if enable {
-                if self.color_math_ctrl.color_math_subtract() {
-                    if half_color {
-                        main.blend::<false, true>(sub)
-                    } else {
-                        main.blend::<false, false>(sub)
-                    }
-                } else {
-                    if half_color {
-                        main.blend::<true, true>(sub)
-                    } else {
-                        main.blend::<true, false>(sub)
-                    }
-                }
+                blend(main, force_main_black, sub, sub_is_transparent)
             } else {
                 main
             };
 
             let result = if master_brightness == 0 {
-                Rgb555::from(0)
+                black
             } else {
                 result.fade(master_brightness + 1)
             };
 
-            // self.line_buffer_main[x as usize] = result.into();
-            // self.copy_line_buffer(self.y - 1);
-
-            let fb_x = x as usize * 2;
-            let fb_y = (self.y as usize - 1) * 2;
-            let pixel = u16_to_pixel(result.into());
-            *self.frame_buffer.pixel_mut(fb_x, fb_y) = pixel.clone();
-            *self.frame_buffer.pixel_mut(fb_x + 1, fb_y) = pixel.clone();
-            *self.frame_buffer.pixel_mut(fb_x, fb_y + 1) = pixel.clone();
-            *self.frame_buffer.pixel_mut(fb_x + 1, fb_y + 1) = pixel;
-        }
-    }
-
-    fn color_math_hires(&mut self) {
-        let master_brightness = self.display_ctrl.master_brightness();
-        let fb_y = (self.y as usize - 1) * 2;
-        for x in 0..SCREEN_WIDTH as usize * 2 {
-            let pixel = if master_brightness == 0 {
-                Rgb555::from(0)
+            if !hires {
+                let pixel = u16_to_pixel(result.into());
+                *self.frame_buffer.pixel_mut(fb_x, fb_y) = pixel.clone();
+                *self.frame_buffer.pixel_mut(fb_x + 1, fb_y) = pixel.clone();
+                *self.frame_buffer.pixel_mut(fb_x, fb_y + 1) = pixel.clone();
+                *self.frame_buffer.pixel_mut(fb_x + 1, fb_y + 1) = pixel;
             } else {
-                Rgb555::from(if x & 1 == 0 {
-                    self.line_buffer_sub[x / 2]
-                } else {
-                    self.line_buffer_main[x / 2]
-                })
-                .fade(master_brightness + 1)
-            };
+                let sub = Rgb555::from(self.line_buffer_sub[x as usize]);
+                let sub_enable = win_enable && {
+                    let pixel_kind = self.attr_buffer_sub[x as usize].kind();
+                    self.color_math_ctrl.color_math_enable_kind() & (1 << pixel_kind) != 0
+                };
 
-            let pixel = u16_to_pixel(pixel.into());
-            *self.frame_buffer.pixel_mut(x, fb_y) = pixel.clone();
-            *self.frame_buffer.pixel_mut(x, fb_y + 1) = pixel;
+                let sub = if sub_enable {
+                    let (blend_color, blend_is_transparent) = if !sub_screen_enable {
+                        (self.sub_backdrop.clone(), false)
+                    } else if x == 0 {
+                        // FIXME: What happens to the subscreen pixel at the left edge of the screen is unknown.
+                        (black, false)
+                    } else {
+                        (
+                            Rgb555::from(self.line_buffer_main[x as usize - 1]),
+                            self.attr_buffer_main[x as usize - 1].kind() == PIXEL_KIND_BACKDROP,
+                        )
+                    };
+                    blend(sub, false, blend_color, blend_is_transparent)
+                } else {
+                    sub
+                };
+
+                let sub = if master_brightness == 0 {
+                    black
+                } else {
+                    sub.fade(master_brightness + 1)
+                };
+
+                let sub = u16_to_pixel(sub.into());
+                *self.frame_buffer.pixel_mut(fb_x as usize, fb_y) = sub.clone();
+                *self.frame_buffer.pixel_mut(fb_x as usize, fb_y + 1) = sub;
+
+                let main = u16_to_pixel(result.into());
+                *self.frame_buffer.pixel_mut(fb_x + 1, fb_y) = main.clone();
+                *self.frame_buffer.pixel_mut(fb_x + 1, fb_y + 1) = main;
+            }
         }
     }
 }
