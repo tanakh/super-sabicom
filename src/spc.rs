@@ -28,6 +28,7 @@ pub struct Spc {
     pub bus_log: Vec<(Option<u16>, Option<u8>, BusAccessType)>,
 
     counter: u64,
+    sync_counter: u64,
     dsp_counter: u64,
 }
 
@@ -48,6 +49,7 @@ impl Default for Spc {
             stop: false,
             bus_log: vec![],
             counter: 0,
+            sync_counter: 0,
             dsp_counter: 0,
         }
     }
@@ -210,7 +212,8 @@ impl Spc {
     }
 
     pub fn write_port(&mut self, port: u8, data: u8, master_clock: u64) {
-        self.ioregs.cpuin[port as usize].push_back((master_to_spc_cycle(master_clock), data))
+        // FIXME: Delay?
+        self.ioregs.cpuin[port as usize].push_back((master_to_spc_cycle(master_clock) + 2, data))
     }
 
     pub fn tick(&mut self, ctx: &mut impl Context) {
@@ -226,7 +229,13 @@ impl Spc {
             self.exec_one();
         }
 
-        let elapsed = self.counter - start;
+        self.sync();
+    }
+
+    fn sync(&mut self) {
+        let elapsed = self.counter - self.sync_counter;
+        self.sync_counter = self.counter;
+
         self.tick_timer(elapsed);
 
         self.dsp_counter += elapsed;
@@ -407,6 +416,8 @@ impl Spc {
     }
 
     fn io_read(&mut self, addr: u16) -> u8 {
+        self.sync();
+
         let data = match addr {
             0 => {
                 warn!("Read TEST");
@@ -443,6 +454,8 @@ impl Spc {
 
     fn io_write(&mut self, addr: u16, data: u8) {
         // debug!("IO Write: {addr:X} = {data:#04X}");
+
+        self.sync();
 
         match addr {
             0 => {
@@ -500,7 +513,8 @@ impl Spc {
                 if addr - 4 == 1 {
                     debug!("CPUIO {port} <- {data:#04X} @ {}", self.counter);
                 }
-                self.ioregs.cpuout[port as usize].push_back((self.counter, data));
+                // FIXME: Delay?
+                self.ioregs.cpuout[port as usize].push_back((self.counter + 2, data));
             }
             8..=9 => self.ioregs.ext_io[addr as usize - 8] = data,
             0xA..=0xC => self.ioregs.timer[addr as usize - 0xA].divider = data,
@@ -1592,6 +1606,7 @@ impl SpcFile {
             stop: false,
             bus_log: vec![],
             counter: 0,
+            sync_counter: 0,
             dsp_counter: 0,
         };
 
