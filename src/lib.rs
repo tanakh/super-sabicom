@@ -15,7 +15,7 @@ use meru_interface::{ConfigUi, EmulatorCore};
 use serde::{Deserialize, Serialize};
 
 pub struct Snes {
-    ctx: Context,
+    pub ctx: Context,
 }
 
 impl Snes {
@@ -58,22 +58,23 @@ impl EmulatorCore for Snes {
     fn game_info(&self) -> Vec<(String, String)> {
         use context::Cartridge;
         let rom = self.ctx.cartridge().rom();
-        let game_code = rom.game_code.map_or_else(
+        let header = &rom.header;
+        let game_code = header.game_code.map_or_else(
             || "N/A".to_string(),
             |b| String::from_utf8_lossy(&b).to_string(),
         );
         vec![
-            ("Title".into(), String::from_utf8_lossy(&rom.title).into()),
+            ("Title".into(), header.title.clone()),
             ("Game Code".into(), game_code),
-            ("Speed".into(), format!("{:?}", rom.speed)),
-            ("Map Mode".into(), format!("{:?}", rom.map_mode)),
-            ("Chipset".into(), format!("{}", rom.chipset)),
-            ("ROM Size".into(), format!("{}", rom.rom_size)),
+            ("Speed".into(), format!("{:?}", header.speed)),
+            ("Map Mode".into(), format!("{:?}", header.map_mode)),
+            ("Chipset".into(), format!("{}", header.chipset)),
+            ("ROM Size".into(), format!("{}", header.rom_size)),
             ("File Size".into(), format!("{}", rom.rom.len())),
-            ("SRAM Size".into(), format!("{}", rom.sram_size)),
-            ("Country".into(), format!("{}", rom.country)),
-            ("Developer ID".into(), format!("{}", rom.developer_id)),
-            ("Rom Version".into(), format!("{}", rom.rom_version)),
+            ("SRAM Size".into(), format!("{}", header.sram_size)),
+            ("Country".into(), format!("{}", header.country)),
+            ("Developer ID".into(), format!("{}", header.developer_id)),
+            ("Rom Version".into(), format!("{}", header.rom_version)),
         ]
     }
 
