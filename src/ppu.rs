@@ -144,8 +144,8 @@ struct DisplayCtrl {
     horizontal_pseudo_512: bool,
     #[skip]
     __: B2,
-    external_sync: B1, // 0: Normal, 1: Super impose and etc.
     extbg_mode: bool,
+    external_sync: B1, // 0: Normal, 1: Super impose and etc.
 }
 
 #[bitfield(bits = 8)]
@@ -973,6 +973,7 @@ impl BgOptEntry {
 }
 
 #[bitfield(bits = 32)]
+#[derive(Copy, Clone)]
 struct ObjEntry {
     x: u8,
     y: u8,
@@ -1212,7 +1213,7 @@ impl Ppu {
                 todo!("BG Mode 6")
             }
             7 => {
-                self.render_bg_mode7(y, 8);
+                self.render_bg_mode7(y, 8, 12, 5);
                 // TODO: EXTBG
             }
             _ => unreachable!(),
@@ -1425,7 +1426,7 @@ impl Ppu {
         self.vram[entry_addr..entry_addr + 2].try_into().unwrap()
     }
 
-    fn render_bg_mode7(&mut self, y: u32, z: u8) {
+    fn render_bg_mode7(&mut self, y: u32, z: u8, z_ext_l: u8, z_ext_h: u8) {
         if self.color_math_ctrl.direct_color() {
             todo!("Direct color in Mode7");
         }
@@ -1474,6 +1475,8 @@ impl Ppu {
         let lx = lx + ((m7b * sy) & !0x3F);
         let ly = ly + ((m7d * sy) & !0x3F);
 
+        let extbg = self.display_ctrl.extbg_mode();
+
         for x in 0..SCREEN_WIDTH {
             let in_win = win_calc.contains(x);
             let render_main = enable_main && !(win_disable_main && in_win);
@@ -1486,25 +1489,21 @@ impl Ppu {
             let vy = ly + m7c * ((x ^ x_flip) as i32);
             let ofs_x = ((vx >> 8) & 7) as usize;
             let ofs_y = ((vy >> 8) & 7) as usize;
-            let tile_x = ((vx >> 11) & 0x7F) as usize;
-            let tile_y = ((vy >> 11) & 0x7F) as usize;
 
-            let (tile_x, tile_y) = if vx >> 18 != 0 || vy >> 18 != 0 {
-                match screen_over {
-                    // Wrap
-                    0 | 1 => (tile_x, tile_y),
-                    // Transparent
-                    2 => continue,
-                    // Filled by tile 0x00
-                    3 => (0, 0),
-                    _ => unreachable!(),
-                }
+            let char_num = if (vx >> 18 == 0 && vy >> 18 == 0) || screen_over <= 1 {
+                // Within screen or wrap
+                let tile_x = ((vx >> 11) & 0x7F) as usize;
+                let tile_y = ((vy >> 11) & 0x7F) as usize;
+                let tile_addr = (tile_x + tile_y * 128) * 2;
+                self.vram[tile_addr] as usize
+            } else if screen_over == 3 {
+                // Filled by tile 0x00
+                0
             } else {
-                (tile_x, tile_y)
+                // Transparent
+                continue;
             };
 
-            let tile_addr = (tile_x + tile_y * 128) * 2;
-            let char_num = self.vram[tile_addr] as usize;
             let char_addr = char_num * 128 + ofs_y * 16 + ofs_x * 2 + 1;
             let pixel = self.vram[char_addr];
 
@@ -1519,6 +1518,26 @@ impl Ppu {
                     self.line_buffer_sub[x as usize] = col;
                     self.attr_buffer_sub[x as usize].set_z(z);
                     self.attr_buffer_sub[x as usize].set_kind(PIXEL_KIND_BG1);
+                }
+            }
+
+            if extbg && pixel & 0x7F != 0 {
+                let z = if (pixel >> 7) & 1 == 0 {
+                    z_ext_l
+                } else {
+                    z_ext_h
+                };
+
+                let col = self.cgram[pixel as usize & 0x7F];
+                if render_main && z < self.attr_buffer_main[x as usize].z() {
+                    self.line_buffer_main[x as usize] = col;
+                    self.attr_buffer_main[x as usize].set_z(z);
+                    self.attr_buffer_main[x as usize].set_kind(PIXEL_KIND_BG2);
+                }
+                if render_sub && z < self.attr_buffer_sub[x as usize].z() {
+                    self.line_buffer_sub[x as usize] = col;
+                    self.attr_buffer_sub[x as usize].set_z(z);
+                    self.attr_buffer_sub[x as usize].set_kind(PIXEL_KIND_BG2);
                 }
             }
         }
