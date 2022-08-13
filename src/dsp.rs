@@ -361,7 +361,11 @@ impl Voice {
         let f0 = ((self.gauss_old[0] as i32 * GAUSS_TABLE[ix] as i32) >> 10) as i16;
 
         let out = f3.wrapping_add(f2);
-        let out = out.wrapping_add(f1);
+
+        // FIXME: The second addition may overflow. In real hardware, overflow seems to produce noise, but it is very noisy, so it is clamped here.
+        // let out = out.wrapping_add(f1);
+        let out = out.saturating_add(f1);
+
         let out = out.saturating_add(f0);
 
         out >> 1
