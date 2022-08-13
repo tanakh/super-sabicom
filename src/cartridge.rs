@@ -64,15 +64,15 @@ impl Cartridge {
         &self.rom
     }
 
-    pub fn read(&self, addr: u32) -> u8 {
-        match self.mapping[(addr >> 11) as usize] {
+    pub fn read(&self, addr: u32) -> Option<u8> {
+        Some(match self.mapping[(addr >> 11) as usize] {
             Mapping::Rom(offset) => self.rom.rom[(offset + (addr & 0x07ff)) as usize],
             Mapping::Ram(offset) => self.sram[(offset + (addr & 0x7ff)) as usize],
             Mapping::None => {
                 warn!("Reading from unmapped region: {addr:06X}");
-                0
+                None?
             }
-        }
+        })
     }
 
     pub fn write(&mut self, addr: u32, data: u8) {

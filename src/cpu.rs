@@ -492,9 +492,6 @@ impl Cpu {
             panic!("Consistency check failed at cycle = {}", ctx.now());
         }
 
-        let prev_i = self.prev_i;
-        self.prev_i = self.regs.p.i();
-
         if self.prev_counter < ctx.now() {
             return;
         }
@@ -525,10 +522,6 @@ impl Cpu {
                 ctx.elapse(INTERNAL_CYCLE);
                 return;
             }
-        }
-
-        if log::log_enabled!(log::Level::Trace) {
-            self.trace(ctx);
         }
 
         let opcode = self.fetch8(ctx);

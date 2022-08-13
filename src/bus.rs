@@ -282,7 +282,7 @@ impl Bus {
                     if DMA == NOT_DMA {
                         ctx.elapse(CYCLES_SLOW);
                     }
-                    ctx.cartridge().read(addr)
+                    ctx.cartridge().read(addr).unwrap_or(self.open_bus)
                 }
                 0x8000..=0xFFFF => {
                     if DMA == NOT_DMA {
@@ -292,14 +292,14 @@ impl Bus {
                             self.ws2_access_cycle
                         });
                     }
-                    ctx.cartridge().read(addr)
+                    ctx.cartridge().read(addr).unwrap_or(self.open_bus)
                 }
             },
             0x40..=0x7D => {
                 if DMA == NOT_DMA {
                     ctx.elapse(CYCLES_SLOW);
                 }
-                ctx.cartridge().read(addr)
+                ctx.cartridge().read(addr).unwrap_or(self.open_bus)
             }
             0x7E..=0x7F => {
                 if DMA == NOT_DMA {
@@ -311,7 +311,7 @@ impl Bus {
                 if DMA == NOT_DMA {
                     ctx.elapse(self.ws2_access_cycle);
                 }
-                ctx.cartridge().read(addr)
+                ctx.cartridge().read(addr).unwrap_or(self.open_bus)
             }
             _ => unreachable!(),
         };
@@ -327,12 +327,12 @@ impl Bus {
         Some(match bank {
             0x00..=0x3F | 0x80..=0xBF => match offset {
                 0x0000..=0x1FFF => self.wram[offset as usize],
-                0x6000..=0xFFFF => ctx.cartridge().read(addr),
+                0x6000..=0xFFFF => ctx.cartridge().read(addr).unwrap_or(0),
                 _ => None?,
             },
-            0x40..=0x7D => ctx.cartridge().read(addr),
+            0x40..=0x7D => ctx.cartridge().read(addr).unwrap_or(0),
             0x7E..=0x7F => self.wram[(addr & 0x1FFFF) as usize],
-            0xC0..=0xFF => ctx.cartridge().read(addr),
+            0xC0..=0xFF => ctx.cartridge().read(addr).unwrap_or(0),
             _ => unreachable!(),
         })
     }
