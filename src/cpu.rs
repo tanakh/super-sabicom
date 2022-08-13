@@ -5,6 +5,7 @@ use std::ops::{BitAnd, BitXor, Shl};
 use crate::context;
 use log::{debug, error, trace};
 use modular_bitfield::prelude::*;
+use serde::{Deserialize, Serialize};
 use super_sabicom_macro::opcodes;
 
 pub trait Context: context::Bus + context::Interrupt + context::Timing {}
@@ -14,6 +15,7 @@ const RESET_VECTOR: u16 = 0xFFFC;
 
 const INTERNAL_CYCLE: u64 = 6;
 
+#[derive(Serialize, Deserialize)]
 pub struct Cpu {
     pub regs: Registers,
     pub stop: bool,
@@ -77,6 +79,7 @@ impl Exception {
     }
 }
 
+#[derive(Serialize, Deserialize)]
 pub struct Registers {
     pub a: u16,
     pub x: u16,
@@ -92,7 +95,7 @@ pub struct Registers {
 
 #[bitfield]
 #[repr(u8)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Serialize, Deserialize)]
 pub struct Status {
     pub c: bool, // Carry
     pub z: bool, // Zero

@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use super_sabicom_macro::{context, delegate};
 
 use crate::{bus, cartridge, cpu, ppu, rom, spc};
@@ -58,6 +59,7 @@ pub trait Timing {
 }
 
 #[context]
+#[derive(Serialize, Deserialize)]
 pub struct Context {
     cpu: cpu::Cpu,
 
@@ -74,7 +76,7 @@ pub struct Context {
     counter: Counter,
 }
 
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 pub struct InterruptCtrl {
     nmi_enable: bool,
     nmi_flag: bool,
@@ -86,7 +88,7 @@ pub struct InterruptCtrl {
     irq: bool,
 }
 
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 pub struct Counter {
     counter: u64,
     pub frame: u64,

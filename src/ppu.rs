@@ -6,13 +6,14 @@ use educe::Educe;
 use log::{debug, info, warn};
 use meru_interface::{FrameBuffer, Pixel};
 use modular_bitfield::prelude::*;
+use serde::{Deserialize, Serialize};
 
 use crate::{consts::*, context};
 
 pub trait Context: context::Interrupt + context::Timing {}
 impl<T: context::Interrupt + context::Timing> Context for T {}
 
-#[derive(Educe)]
+#[derive(Educe, Serialize, Deserialize)]
 #[educe(Default)]
 pub struct Ppu {
     display_ctrl: DisplayCtrl,
@@ -83,20 +84,21 @@ pub struct Ppu {
     open_bus1: u8,
     open_bus2: u8,
 
+    #[serde(skip)]
     frame_buffer: FrameBuffer,
 
-    #[educe(Default(expression = "vec![0; SCREEN_WIDTH.try_into().unwrap()]"))]
+    #[serde(skip)]
     line_buffer_main: Vec<u16>,
-    #[educe(Default(expression = "vec![0; SCREEN_WIDTH.try_into().unwrap()]"))]
+    #[serde(skip)]
     line_buffer_sub: Vec<u16>,
-    #[educe(Default(expression = "vec![Default::default(); SCREEN_WIDTH.try_into().unwrap()]"))]
+    #[serde(skip)]
     attr_buffer_main: Vec<PixelAttr>,
-    #[educe(Default(expression = "vec![Default::default(); SCREEN_WIDTH.try_into().unwrap()]"))]
+    #[serde(skip)]
     attr_buffer_sub: Vec<PixelAttr>,
 }
 
 #[bitfield(bits = 16)]
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone, Copy, Serialize, Deserialize)]
 #[repr(u16)]
 struct Rgb555 {
     r: B5,
@@ -133,7 +135,7 @@ impl Rgb555 {
 }
 
 #[bitfield(bits = 16)]
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 struct DisplayCtrl {
     master_brightness: B4,
     #[skip]
@@ -150,7 +152,7 @@ struct DisplayCtrl {
 }
 
 #[bitfield(bits = 8)]
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 struct ObjSel {
     obj_base_addr: B3,
     obj_addr_gap: B2,
@@ -203,7 +205,7 @@ impl ObjSizeSel {
 }
 
 #[bitfield(bits = 8)]
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 struct VramAddrIncMode {
     step: B2,        // 0..3 = Increment Word-Address by 1,32,128,128
     translation: B2, // 0..3 = 0bit/None, 8bit, 9bit, 10bit
@@ -238,7 +240,7 @@ impl VramAddrIncMode {
 }
 
 #[bitfield(bits = 16)]
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 struct OamAddr {
     addr: B9,
     #[skip]
@@ -247,7 +249,7 @@ struct OamAddr {
 }
 
 #[bitfield(bits = 8)]
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Serialize, Deserialize)]
 struct BgMode {
     mode: B3,
     bg3_priority_is_high: bool,
@@ -282,14 +284,14 @@ impl BgMode {
 }
 
 #[bitfield(bits = 8)]
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 struct Mosaic {
     enable: B4,
     size: B4,
 }
 
 #[bitfield(bits = 8)]
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 struct ScreenBaseAndSize {
     size: ScreenSize,
     base_addr: B6,
@@ -318,7 +320,7 @@ enum ScreenSize {
 }
 
 #[bitfield(bits = 8)]
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 struct RotSetting {
     h_flip: bool,
     v_flip: bool,
@@ -327,7 +329,7 @@ struct RotSetting {
     screen_over: B2, // 0, 1: wrap, 2: transparent, 3: filled by tile 0x00
 }
 
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 struct RotParam {
     // 1bit sign, 7bit integer, 8bit fraction
     a: u16,
@@ -339,7 +341,7 @@ struct RotParam {
     y: u16,
 }
 
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Serialize, Deserialize)]
 struct WinMask {
     bg: [WinMaskSettings; 4],
     obj: WinMaskSettings,
@@ -347,7 +349,7 @@ struct WinMask {
 }
 
 #[bitfield(bits = 8)]
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Serialize, Deserialize)]
 struct WinMaskSettings {
     area1: WinMaskSetting,
     area2: WinMaskSetting,
@@ -362,14 +364,14 @@ struct WinMaskSetting {
     enable: bool,
 }
 
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 struct WinPos {
     left: u8,
     right: u8,
 }
 
 #[bitfield(bits = 16)]
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 struct WinLogic {
     bg1: MaskLogic,
     bg2: MaskLogic,
@@ -405,7 +407,7 @@ enum MaskLogic {
 }
 
 #[bitfield(bits = 8)]
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Serialize, Deserialize)]
 struct ScreenDesig {
     bg1: bool,
     bg2: bool,
@@ -429,7 +431,7 @@ impl ScreenDesig {
 }
 
 #[bitfield(bits = 16)]
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Serialize, Deserialize)]
 struct ColorMathCtrl {
     direct_color: bool,
     sub_screen_enable: bool,
@@ -1153,6 +1155,15 @@ impl Ppu {
         // FIXME: support overscan mode
         if (self.frame_buffer.width, self.frame_buffer.height) != (512, 448) {
             self.frame_buffer.resize(512, 448);
+        }
+
+        if self.line_buffer_main.len() != SCREEN_WIDTH as usize {
+            self.line_buffer_main.resize(SCREEN_WIDTH as usize, 0);
+            self.line_buffer_sub.resize(SCREEN_WIDTH as usize, 0);
+            self.attr_buffer_main
+                .resize(SCREEN_WIDTH as usize, PixelAttr::default());
+            self.attr_buffer_sub
+                .resize(SCREEN_WIDTH as usize, PixelAttr::default());
         }
 
         if self.display_ctrl.force_blank() {

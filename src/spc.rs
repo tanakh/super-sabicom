@@ -5,6 +5,7 @@ use crate::dsp::Dsp;
 use log::{debug, info, trace, warn, Level};
 use meru_interface::AudioBuffer;
 use modular_bitfield::prelude::*;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::VecDeque,
     fmt::Display,
@@ -17,6 +18,7 @@ use crate::context;
 pub trait Context: context::Timing {}
 impl<T: context::Timing> Context for T {}
 
+#[derive(Serialize, Deserialize)]
 pub struct Spc {
     pub regs: Registers,
     pub ioregs: IORegisters,
@@ -25,18 +27,9 @@ pub struct Spc {
     sleep: bool,
     stop: bool,
 
-    pub bus_log: Vec<(Option<u16>, Option<u8>, BusAccessType)>,
-
     counter: u64,
     sync_counter: u64,
     dsp_counter: u64,
-}
-
-#[derive(Debug, Clone)]
-pub enum BusAccessType {
-    Read,
-    Write,
-    Wait,
 }
 
 impl Default for Spc {
@@ -47,7 +40,6 @@ impl Default for Spc {
             dsp: Dsp::default(),
             sleep: false,
             stop: false,
-            bus_log: vec![],
             counter: 0,
             sync_counter: 0,
             dsp_counter: 0,
@@ -55,6 +47,7 @@ impl Default for Spc {
     }
 }
 
+#[derive(Serialize, Deserialize)]
 pub struct Registers {
     pub a: u8,
     pub x: u8,
@@ -66,7 +59,7 @@ pub struct Registers {
 
 #[bitfield]
 #[repr(u8)]
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone, Copy, Serialize, Deserialize)]
 pub struct Flags {
     c: bool, // 0: Borrow or no-carry, 1: Carry or no-borrow
     z: bool,
@@ -112,6 +105,7 @@ impl Registers {
     }
 }
 
+#[derive(Serialize, Deserialize)]
 pub struct IORegisters {
     pub timer_enable: bool, // ???
     pub ram_write_enable: bool,
@@ -128,7 +122,7 @@ pub struct IORegisters {
     counter2: u64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 struct Timer {
     enable: bool,
     divider: u8,
@@ -341,9 +335,6 @@ impl Spc {
             }
         };
         // trace!("Read:  {addr:#06X} = {data:#04X}");
-        // self.bus_log
-        //     .push((Some(addr), Some(data), BusAccessType::Read));
-
         data
     }
 
@@ -357,8 +348,6 @@ impl Spc {
 
     fn write8(&mut self, addr: u16, data: u8) {
         // trace!("Write: {addr:#06X} = {data:#04X}");
-        // self.bus_log
-        //     .push((Some(addr), Some(data), BusAccessType::Write));
         if self.ioregs.ram_write_enable {
             self.dsp.ram[addr as usize] = data;
         }
@@ -539,12 +528,11 @@ impl Spc {
         }
 
         macro_rules! elapse {
+            // FIXME: If sync is specified, pc + 1 will be send to address bus and read
             (ram, $n:expr $(, $sync:tt)?) => {{
-                bus_log!($n $(, $sync)*);
                 self.counter += self.ioregs.ram_wait_cycle * $n
             }};
             (io, $n:expr $(, $sync:tt)?) => {{
-                bus_log!($n $(, $sync)*);
                 self.counter += self.ioregs.io_wait_cycle * $n
             }};
         }
@@ -1589,7 +1577,6 @@ impl SpcFile {
             dsp: Dsp::default(),
             sleep: false,
             stop: false,
-            bus_log: vec![],
             counter: 0,
             sync_counter: 0,
             dsp_counter: 0,

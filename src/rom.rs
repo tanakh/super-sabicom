@@ -1,16 +1,23 @@
 use std::fmt::Display;
 
+use educe::Educe;
 use thiserror::Error;
 
+#[derive(Default, Clone)]
 pub struct Rom {
     pub header: Header,
     pub rom: Vec<u8>,
 }
 
+#[derive(Educe, Clone)]
+#[educe(Default)]
 pub struct Header {
     pub title: String,
+    #[educe(Default(expression = "Speed::Slow"))]
     pub speed: Speed,
+    #[educe(Default(expression = "MapMode::LoRom"))]
     pub map_mode: MapMode,
+    #[educe(Default(expression = "Chipset::new(0, 0)"))]
     pub chipset: Chipset,
     pub rom_size: usize,
     pub sram_size: usize,
@@ -29,7 +36,7 @@ impl Header {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum Speed {
     Slow,
     Fast,
@@ -45,7 +52,7 @@ impl From<u8> for Speed {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum MapMode {
     LoRom,
     HiRom,
@@ -70,7 +77,7 @@ impl From<u8> for MapMode {
     }
 }
 
-#[derive(Default, Debug)]
+#[derive(Default, Clone, Debug)]
 pub struct Chipset {
     pub code: u8,
     pub subclass: u8,
@@ -142,7 +149,7 @@ impl Chipset {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum Coprocessor {
     Dsp,     // DSP1, DSP1A, DSP1B, DSP2, DSP3, DSP4
     Gsu,     // MarioChip1, GSU1, GSU2, GSU2-SP1
@@ -222,7 +229,7 @@ fn parse_coprocessor(c: u8, subclass: u8) -> Coprocessor {
     }
 }
 
-#[derive(Error, Debug)]
+#[derive(Clone, Error, Debug)]
 pub enum RomError {
     #[error("invalid rom size")]
     InvalidRomSize,

@@ -2,8 +2,9 @@ use educe::Educe;
 use log::{debug, trace};
 use meru_interface::{AudioBuffer, AudioSample};
 use modular_bitfield::prelude::*;
+use serde::{Deserialize, Serialize};
 
-#[derive(Educe)]
+#[derive(Educe, Serialize, Deserialize)]
 #[educe(Default)]
 pub struct Dsp {
     master_volume: [i8; 2],
@@ -15,7 +16,7 @@ pub struct Dsp {
     echo_buf_size: u8,
     na: u8,
 
-    #[educe(Default(expression = "[0, 1, 2, 3, 4, 5, 6, 7].map(Voice::new)"))]
+    #[educe(Default(expression = "std::array::from_fn(Voice::new)"))]
     voice: [Voice; 8],
     #[educe(Default = 1)]
     noise: i16,
@@ -29,10 +30,12 @@ pub struct Dsp {
     #[educe(Default(expression = "vec![0; 0x10000]"))]
     pub ram: Vec<u8>,
 
+    #[serde(skip)]
     pub audio_buffer: AudioBuffer,
 }
 
 #[bitfield(bits = 8)]
+#[derive(Serialize, Deserialize)]
 struct Flags {
     // 0-4  Noise frequency    (0=Stop, 1=16Hz, 2=21Hz, ..., 1Eh=16kHz, 1Fh=32kHz)
     noise_freq: B5,
@@ -50,7 +53,7 @@ impl Default for Flags {
     }
 }
 
-#[derive(Educe)]
+#[derive(Educe, Serialize, Deserialize)]
 #[educe(Default)]
 struct Voice {
     ch: usize,
@@ -92,7 +95,7 @@ impl Voice {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 enum EnvelopeState {
     #[default]
     Attack,
@@ -102,7 +105,7 @@ enum EnvelopeState {
 }
 
 #[bitfield(bits = 8)]
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Serialize, Deserialize)]
 struct BrrBlockHeader {
     end: bool,
     repeat: bool,
@@ -111,7 +114,7 @@ struct BrrBlockHeader {
 }
 
 #[bitfield(bits = 16)]
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Serialize, Deserialize)]
 struct AdsrSetting {
     attack_rate: B4, // Rate=N*2+1, Step=+32 (or Step=+1024 when Rate=31)
     decay_rate: B3,  // Rate=N*2+16, Step=-(((Level-1) SAR 8)+1)

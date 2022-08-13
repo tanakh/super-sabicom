@@ -1,10 +1,14 @@
 use log::warn;
+use serde::{Deserialize, Serialize};
 
 use crate::rom::{MapMode, Rom};
 
+#[derive(Serialize, Deserialize)]
 pub struct Cartridge {
+    #[serde(skip)]
     rom: Rom,
     sram: Vec<u8>,
+    #[serde(skip)]
     mapping: Vec<Mapping>,
 }
 
@@ -58,6 +62,11 @@ impl Cartridge {
         } else {
             None
         }
+    }
+
+    pub fn restore(&mut self, origin: &mut Cartridge) {
+        std::mem::swap(&mut self.rom, &mut origin.rom);
+        self.mapping = make_mapping(&self.rom);
     }
 
     pub fn rom(&self) -> &Rom {

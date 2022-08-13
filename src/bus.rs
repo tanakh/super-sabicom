@@ -1,5 +1,6 @@
 use log::{debug, info, trace, warn};
 use modular_bitfield::prelude::*;
+use serde::{Deserialize, Serialize};
 
 use crate::context;
 
@@ -17,6 +18,7 @@ impl<
 {
 }
 
+#[derive(Serialize, Deserialize)]
 pub struct Bus {
     ws2_access_cycle: u64,
     interrupt_enable: InterruptEnable,
@@ -42,7 +44,7 @@ pub struct Bus {
 }
 
 #[bitfield(bits = 8)]
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Serialize, Deserialize)]
 struct InterruptEnable {
     joypad_enable: bool, // Enable Automatic Reading of Joypad
     #[skip]
@@ -53,7 +55,7 @@ struct InterruptEnable {
     vblank_nmi_enable: bool,
 }
 
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 struct Dma {
     param: DmaParam,
     iobus_addr: u8,
@@ -99,7 +101,7 @@ impl Dma {
 }
 
 #[bitfield(bits = 8)]
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Serialize, Deserialize)]
 struct DmaParam {
     transfer_unit: B3,
     abus_addr_step: DmaAddrStep,
@@ -164,7 +166,7 @@ impl Default for Bus {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 struct ControllerPort {
     pad_data: [u16; 2],
     clk: bool,

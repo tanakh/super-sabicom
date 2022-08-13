@@ -6,7 +6,7 @@ use std::{
 
 use anyhow::{anyhow, bail, Result};
 use compress_tools::{list_archive_files, uncompress_archive_file};
-use log::info;
+use log::{error, info};
 use meru_interface::{
     key_assign::{InputState, KeyCode, SingleKey},
     EmulatorCore,
@@ -107,6 +107,34 @@ fn save_backup(rom_path: &Path, backup: Vec<u8>) -> Result<()> {
     Ok(())
 }
 
+fn state_filename(rom_path: &Path, slot: u32) -> Result<PathBuf> {
+    Ok(backup_dir()?.join(
+        rom_path
+            .with_extension(format!("{slot}.state"))
+            .file_name()
+            .unwrap(),
+    ))
+}
+
+fn load_state(snes: &mut Snes, rom_path: &Path, slot: u32) -> Result<()> {
+    let state_path = state_filename(rom_path, slot)?;
+
+    if !state_path.exists() {
+        bail!("State {slot} does not exist");
+    }
+
+    let data = std::fs::read(state_path)?;
+    snes.load_state(&data)?;
+
+    Ok(())
+}
+
+fn save_state(snes: &Snes, rom_path: &Path, slot: u32) -> Result<()> {
+    let state_path = state_filename(rom_path, slot)?;
+    std::fs::write(state_path, snes.save_state())?;
+    Ok(())
+}
+
 fn print_game_info(snes: &Snes) {
     use super_sabicom::context::Cartridge;
 
@@ -192,24 +220,28 @@ fn run(rom_path: &Path) -> Result<()> {
     let mut cur_slot = 0_u32;
 
     while process_events(&mut event_pump) {
-        // let start_time = std::time::Instant::now();
-
         im.update(&event_pump);
 
-        // if im.hotkey_pressed(HotKey::SaveState) {
-        //     save_state(&agb, &rom_path, cur_slot)?;
-        // }
-        // if im.hotkey_pressed(HotKey::LoadState) {
-        //     if let Err(err) = load_state(&mut agb, &rom_path, cur_slot) {
-        //         error!("Failed to load state from slot {cur_slot}: {err}");
-        //     }
-        // }
+        if im.hotkey(HotKey::SaveState).just_pressed(&im) {
+            if let Err(err) = save_state(&snes, &rom_path, cur_slot) {
+                error!("Failed to save state to slot {cur_slot}: {err}");
+            } else {
+                info!("State saved to slot {cur_slot}");
+            }
+        }
+        if im.hotkey(HotKey::LoadState).just_pressed(&im) {
+            if let Err(err) = load_state(&mut snes, &rom_path, cur_slot) {
+                error!("Failed to load state from slot {cur_slot}: {err}");
+            } else {
+                info!("State loaded from slot {cur_slot}");
+            }
+        }
 
-        if im.hotkey_pressed(HotKey::NextSlot) {
+        if im.hotkey(HotKey::NextSlot).just_pressed(&im) {
             cur_slot += 1;
             info!("State save slot changed: {cur_slot}");
         }
-        if im.hotkey_pressed(HotKey::PrevSlot) {
+        if im.hotkey(HotKey::PrevSlot).just_pressed(&im) {
             cur_slot = cur_slot.saturating_sub(1);
             info!("State save slot changed: {cur_slot}");
         }
@@ -238,11 +270,6 @@ fn run(rom_path: &Path) -> Result<()> {
         canvas.present();
 
         let audio_buf = snes.audio_buffer();
-        // assert!(
-        //     (532..=534).contains(&audio_buf.samples.len()),
-        //     "invalid generated audio length: {}",
-        //     audio_buf.samples.len()
-        // );
 
         // Sync to audio
         while audio_queue.size() > SOUND_BUF_LEN as u32 * 4 {
@@ -258,12 +285,6 @@ fn run(rom_path: &Path) -> Result<()> {
                     .collect::<Vec<i16>>(),
             )
             .unwrap();
-
-        // let elapsed = std::time::Instant::now() - start_time;
-        // let wait = std::time::Duration::from_nanos(1_000_000_000u64 / 60);
-        // if wait > elapsed {
-        //     std::thread::sleep(wait - elapsed);
-        // }
 
         frames += 1;
 
@@ -284,25 +305,25 @@ fn run(rom_path: &Path) -> Result<()> {
 fn process_events(event_pump: &mut EventPump) -> bool {
     for event in event_pump.poll_iter() {
         match event {
-            Event::Quit { .. }
-            | Event::KeyDown {
-                keycode: Some(Keycode::Escape),
-                ..
-            } => return false,
+            Event::Quit { .. } => return false,
             _ => {}
         }
     }
     true
 }
 
+use meru_interface::key_assign::*;
+
 struct InputManager {
-    pressed_scancodes: Vec<Scancode>,
+    cur_state: State,
+    prev_state: State,
     controllers: Vec<GameController>,
-    // key_bind: Vec<(Key, KeyBind)>,
-    // cur_key_input: Vec<bool>,
-    hotkey: Vec<(HotKey, KeyBind)>,
-    cur_hotkey: Vec<bool>,
-    prev_hotkey: Vec<bool>,
+    hotkey: Vec<(HotKey, KeyAssign)>,
+}
+
+#[derive(Default)]
+struct State {
+    pressed_scancodes: Vec<Scancode>,
 }
 
 #[derive(PartialEq, Eq)]
@@ -311,27 +332,6 @@ enum HotKey {
     LoadState,
     NextSlot,
     PrevSlot,
-}
-
-enum KeyBind {
-    Scancode(Scancode),
-    Button(Button),
-    And(Vec<KeyBind>),
-    Or(Vec<KeyBind>),
-}
-
-macro_rules! kbd {
-    ($key:ident) => {
-        KeyBind::Scancode(Scancode::$key)
-    };
-}
-
-impl std::ops::BitOr for KeyBind {
-    type Output = KeyBind;
-
-    fn bitor(self, rhs: Self) -> Self::Output {
-        KeyBind::Or(vec![self, rhs])
-    }
 }
 
 macro_rules! def_key_bind {
@@ -343,28 +343,24 @@ macro_rules! def_key_bind {
     };
 }
 
-fn default_hotkey() -> Vec<(HotKey, KeyBind)> {
+fn default_hotkey() -> Vec<(HotKey, KeyAssign)> {
     use HotKey::*;
     def_key_bind! {
-        SaveState => kbd!(F5),
-        LoadState => kbd!(F7),
-        NextSlot => kbd!(F3),
-        PrevSlot => kbd!(F2),
+        SaveState => keycode!(F5),
+        LoadState => keycode!(F7),
+        NextSlot => keycode!(F3),
+        PrevSlot => keycode!(F2),
     }
 }
 
 impl InputManager {
     fn new(controllers: Vec<GameController>) -> Self {
-        // let key_bind = default_key_bind();
         let hotkey = default_hotkey();
 
         Self {
-            pressed_scancodes: vec![],
+            cur_state: State::default(),
+            prev_state: State::default(),
             controllers,
-            // cur_key_input: vec![false; key_bind.len()],
-            // key_bind,
-            cur_hotkey: vec![false; hotkey.len()],
-            prev_hotkey: vec![false; hotkey.len()],
             hotkey,
         }
     }
@@ -372,30 +368,27 @@ impl InputManager {
     fn update(&mut self, e: &EventPump) {
         let ks = e.keyboard_state();
 
-        self.pressed_scancodes = ks.pressed_scancodes().collect();
+        std::mem::swap(&mut self.prev_state, &mut self.cur_state);
 
-        // for (i, (_, key_bind)) in self.key_bind.iter().enumerate() {
-        //     self.cur_key_input[i] = self.pressed(&ks, key_bind);
-        // }
-
-        // self.prev_hotkey.copy_from_slice(&self.cur_hotkey);
-
-        // for (i, (_, key_bind)) in self.hotkey.iter().enumerate() {
-        //     self.cur_hotkey[i] = self.pressed(&ks, key_bind);
-        // }
+        self.cur_state.pressed_scancodes = ks.pressed_scancodes().collect();
     }
 
-    fn hotkey_pressed(&self, hotkey: HotKey) -> bool {
-        for (i, (key, _)) in self.hotkey.iter().enumerate() {
-            if *key == hotkey {
-                return !self.prev_hotkey[i] && self.cur_hotkey[i];
-            }
-        }
-        false
+    fn hotkey(&self, hotkey: HotKey) -> &KeyAssign {
+        &self.hotkey.iter().find(|r| r.0 == hotkey).unwrap().1
     }
 }
 
 impl InputState for InputManager {
+    fn pressed(&self, key: &SingleKey) -> bool {
+        self.cur_state.pressed(key)
+    }
+
+    fn just_pressed(&self, key: &SingleKey) -> bool {
+        !self.prev_state.pressed(key) && self.cur_state.pressed(key)
+    }
+}
+
+impl State {
     fn pressed(&self, key: &SingleKey) -> bool {
         match key {
             SingleKey::KeyCode(code) => self
@@ -405,10 +398,6 @@ impl InputState for InputManager {
             SingleKey::GamepadButton(_) => todo!(),
             SingleKey::GamepadAxis(_, _) => todo!(),
         }
-    }
-
-    fn just_pressed(&self, key: &SingleKey) -> bool {
-        todo!()
     }
 }
 

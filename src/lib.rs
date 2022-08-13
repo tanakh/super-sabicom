@@ -96,7 +96,12 @@ impl EmulatorCore for Snes {
     }
 
     fn reset(&mut self) {
-        todo!()
+        use context::Cartridge;
+
+        let rom = self.ctx.cartridge().rom().clone();
+        let backup = self.backup();
+
+        self.ctx = Context::from_rom(rom, backup.as_deref());
     }
 
     fn frame_buffer(&self) -> &meru_interface::FrameBuffer {
@@ -143,10 +148,17 @@ impl EmulatorCore for Snes {
     }
 
     fn save_state(&self) -> Vec<u8> {
-        todo!()
+        bincode::serialize(&self.ctx).unwrap()
     }
 
     fn load_state(&mut self, data: &[u8]) -> anyhow::Result<()> {
-        todo!()
+        use context::Cartridge;
+
+        let mut ctx: Context = bincode::deserialize(data)?;
+
+        // Restore ROM and memory mapping
+        ctx.cartridge_mut().restore(self.ctx.cartridge_mut());
+
+        Ok(())
     }
 }

@@ -7,7 +7,7 @@ use syn::{
     parse2, parse_macro_input, parse_str,
     punctuated::Punctuated,
     token::Paren,
-    Expr, Field, FnArg, Ident, ItemStruct, ItemTrait, LitInt, Pat, Token, TraitItem,
+    Attribute, Expr, Field, FnArg, Ident, ItemStruct, ItemTrait, LitInt, Pat, Token, TraitItem,
     TraitItemMethod,
 };
 
@@ -160,6 +160,7 @@ pub fn context(_attr: TokenStream, item: TokenStream) -> TokenStream {
         &mut types,
         &mut ctor,
         &mut ctor_args,
+        &attrs,
         &mut vec![],
         quote! { #(#attrs)* #vis struct #ident #generics },
         &ident,
@@ -206,6 +207,7 @@ fn gen_types(
     code: &mut Vec<proc_macro2::TokenStream>,
     ctor: &mut proc_macro2::TokenStream,
     ctor_args: &mut Vec<proc_macro2::TokenStream>,
+    attrs: &[Attribute],
     impl_traits: &mut Vec<Ident>,
     sig: proc_macro2::TokenStream,
     ty: &Ident,
@@ -250,8 +252,9 @@ fn gen_types(
             code,
             ctor,
             ctor_args,
+            attrs,
             impl_traits,
-            quote! { struct #inner_type },
+            quote! { #(#attrs)* struct #inner_type },
             inner_type,
             &fields[i..],
         );
