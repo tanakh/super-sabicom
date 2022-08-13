@@ -34,6 +34,7 @@ pub struct Bus {
 
     gdma_do_transfer: bool,
     controller_port: [ControllerPort; 2],
+    joypad_auto_read_busy: u64,
     open_bus: u8,
 
     wram: Vec<u8>,
@@ -155,6 +156,7 @@ impl Default for Bus {
             dma: Default::default(),
             gdma_do_transfer: false,
             controller_port: Default::default(),
+            joypad_auto_read_busy: 0,
             open_bus: 0,
             wram: vec![0; 0x20000], // 128KB
             wram_addr: 0,
@@ -164,7 +166,6 @@ impl Default for Bus {
 
 #[derive(Default)]
 struct ControllerPort {
-    enable: bool,
     pad_data: [u16; 2],
     clk: bool,
     pos: usize,
@@ -185,19 +186,20 @@ impl Bus {
             let mut data = 0;
 
             for (name, value) in &input.controllers[i] {
+                let value = *value as u16;
                 match name.as_str() {
-                    "B" => data |= (*value as u16) << 15,
-                    "Y" => data |= (*value as u16) << 14,
-                    "Select" => data |= (*value as u16) << 13,
-                    "Start" => data |= (*value as u16) << 12,
-                    "Up" => data |= (*value as u16) << 11,
-                    "Down" => data |= (*value as u16) << 10,
-                    "Left" => data |= (*value as u16) << 9,
-                    "Right" => data |= (*value as u16) << 8,
-                    "A" => data |= (*value as u16) << 7,
-                    "X" => data |= (*value as u16) << 6,
-                    "L" => data |= (*value as u16) << 5,
-                    "R" => data |= (*value as u16) << 4,
+                    "B" => data |= value << 15,
+                    "Y" => data |= value << 14,
+                    "Select" => data |= value << 13,
+                    "Start" => data |= value << 12,
+                    "Up" => data |= value << 11,
+                    "Down" => data |= value << 10,
+                    "Left" => data |= value << 9,
+                    "Right" => data |= value << 8,
+                    "A" => data |= value << 7,
+                    "X" => data |= value << 6,
+                    "L" => data |= value << 5,
+                    "R" => data |= value << 4,
                     _ => unreachable!(),
                 }
             }
@@ -207,6 +209,11 @@ impl Bus {
     }
 
     pub fn tick(&mut self, ctx: &mut impl Context) {
+        if ctx.ppu_mut().auto_joypad_read() && self.interrupt_enable.joypad_enable() {
+            self.joypad_auto_read_busy = ctx.now() + 4224;
+            self.auto_joypad_read();
+        }
+
         self.dma_exec(ctx, true);
     }
 
@@ -444,9 +451,7 @@ impl Bus {
             0x2140..=0x217F => {
                 let now = ctx.now();
                 let ret = ctx.spc_mut().read_port((addr & 3) as _, now);
-                if addr & 3 == 1 {
-                    debug!("SPC {} -> {:02X} @ {}", addr & 3, ret, ctx.now());
-                }
+                debug!("SPC {} -> {:02X} @ {}", addr & 3, ret, ctx.now());
                 ret
             }
 
@@ -460,21 +465,21 @@ impl Bus {
             // CPU On-Chip I/O Ports
             // JOYA - Joypad Input Register A (R)
             0x4016 => {
-                info!("Read JOYA");
-                let b0 = !self.controller_read(0, 4);
-                let b1 = !self.controller_read(0, 5);
+                let b0 = self.controller_read(0, 4);
+                let b1 = self.controller_read(0, 5);
                 self.controller_write(0, 2, true);
                 self.controller_write(0, 2, false);
-                b0 as u8 | (b1 as u8) << 1 | self.open_bus & 0x7C
+                debug!("Read JOYA: JOY1 = {b0}, JOY3 = {b1}");
+                b0 as u8 | (b1 as u8) << 1 | self.open_bus & 0xFC
             }
             // JOYB - Joypad Input Register B (R)
             0x4017 => {
-                info!("Read JOYB");
                 // FIXME: Manual read from joy pad and strobe
-                let b0 = !self.controller_read(1, 4);
-                let b1 = !self.controller_read(1, 5);
+                let b0 = self.controller_read(1, 4);
+                let b1 = self.controller_read(1, 5);
                 self.controller_write(1, 2, true);
                 self.controller_write(1, 2, false);
+                debug!("Read JOYB: JOY2 = {b0}, JOY4 = {b1}");
                 b0 as u8 | (b1 as u8) << 1 | 0x1C | self.open_bus & 0xE0
             }
 
@@ -496,7 +501,7 @@ impl Bus {
             // HVBJOY - H/V-Blank flag and Joypad Busy flag (R)
             0x4212 => {
                 let mut ret = 0;
-                // FIXME: bit 0 = Auto-Joypad-Read Busy Flag (1=Busy)
+                ret |= (ctx.now() < self.joypad_auto_read_busy) as u8;
                 ret |= (ctx.ppu().hblank() as u8) << 6;
                 ret |= (ctx.ppu().vblank() as u8) << 7;
                 ret | self.open_bus & 0x3E
@@ -504,10 +509,10 @@ impl Bus {
 
             // RDIO    - Joypad Programmable I/O Port (Input)
             0x4213 => {
-                info!("Read RDIO");
-                let b6 = self.controller_read(0, 6);
-                let b7 = self.controller_read(1, 6);
-                (b6 as u8) << 6 | (b7 as u8) << 7
+                let b6 = self.controller_read(0, 6) as u8;
+                let b7 = self.controller_read(1, 6) as u8;
+                debug!("Read RDIO: port 1 = {b6}, port 2 = {b7}");
+                b6 << 6 | b7 << 7
             }
 
             // RDDIVL/H - Unsigned Division Result (Quotient)
@@ -520,7 +525,7 @@ impl Bus {
             0x4218..=0x421F => {
                 let i = (addr - 0x4218) as usize / 2;
                 let h = (addr - 0x4218) as usize % 2;
-                info!("JOY{i}{}", if h == 0 { 'L' } else { 'H' });
+                debug!("JOY{i}{}", if h == 0 { 'L' } else { 'H' });
                 (self.controller_port[i % 2].pad_data[i / 2] >> (8 * h)) as u8
             }
 
@@ -555,9 +560,7 @@ impl Bus {
         match addr {
             0x2100..=0x213F => ctx.ppu_write(addr, data),
             0x2140..=0x217F => {
-                if addr & 3 == 1 {
-                    debug!("SPC {} <- {:02X} @ {}", addr & 3, data, ctx.now());
-                }
+                debug!("SPC {} <- {:02X} @ {}", addr & 3, data, ctx.now());
                 let now = ctx.now();
                 ctx.spc_mut().write_port((addr & 3) as _, data, now);
             }
@@ -572,11 +575,9 @@ impl Bus {
 
             // CPU On-Chip I/O Ports
             0x4016 => {
-                info!("WRITE JOYWR: {data:02X}");
-                if data & 1 != 0 {
-                    self.controller_write(0, 3, true);
-                    self.controller_write(1, 3, true);
-                }
+                debug!("WRITE JOYWR: {data:02X}");
+                self.controller_write(0, 3, data & 1 != 0);
+                self.controller_write(1, 3, data & 1 != 0);
             }
 
             // CPU On-Chip I/O Ports (Write-only) (Read=open bus)
@@ -588,8 +589,13 @@ impl Bus {
                 debug!("NMITIMEN = {:?}", self.interrupt_enable);
             }
             0x4201 => {
-                self.controller_port[0].enable = data & (1 << 6) != 0;
-                self.controller_port[1].enable = data & (1 << 7) != 0;
+                debug!(
+                    "WRIO: port 1 = {}, port 2 = {}",
+                    data & (1 << 6),
+                    data & (1 << 7)
+                );
+                self.controller_write(0, 6, data & (1 << 6) != 0);
+                self.controller_write(1, 6, data & (1 << 7) != 0);
             }
             0x4202 => self.mul_a = data,
             0x4203 => {
@@ -630,11 +636,11 @@ impl Bus {
             }
             0x420B => {
                 self.gdma_enable = data;
-                info!("GDMA Enable: {data:08b} @ y = {}", ctx.counter().y);
+                debug!("GDMA Enable: {data:08b} @ y = {}", ctx.counter().y);
             }
             0x420C => {
                 self.hdma_enable = data;
-                info!("HDMA Enable: {data:08b} @ y = {}", ctx.counter().y);
+                debug!("HDMA Enable: {data:08b} @ y = {}", ctx.counter().y);
             }
             0x420D => self.ws2_access_cycle = if data & 1 == 0 { 8 } else { 6 },
 
@@ -952,16 +958,20 @@ impl Bus {
     fn controller_read(&mut self, port: usize, pin: usize) -> bool {
         let controller = &self.controller_port[port];
 
-        if !controller.enable {
-            return false;
-        }
-
         match pin {
-            4 => controller.pos < 16 && controller.pad_data[0] & (1 << controller.pos) != 0,
-            5 => controller.pos < 16 && controller.pad_data[1] & (1 << controller.pos) != 0,
+            4 | 5 => {
+                let i = pin - 4;
+                if controller.pos < 16 {
+                    // 0=High=Released, 1=Low=Pressed
+                    controller.pad_data[i] & (1 << 15 - controller.pos) != 0
+                } else {
+                    // always 1=Low
+                    true
+                }
+            }
             6 => {
                 // FIXME
-                warn!("Read controller port {port}, pin {pin}");
+                info!("Read controller port {port}, pin {pin}");
                 true
             }
             _ => unreachable!(),
@@ -978,14 +988,26 @@ impl Bus {
                 }
             }
             3 => {
-                self.controller_port[port].pos = 0;
-                self.controller_port[port].clk = false;
+                if data {
+                    self.controller_port[port].pos = 0;
+                    self.controller_port[port].clk = false;
+                }
             }
             6 => {
                 // FIXME
-                warn!("Write controller port {port}, pin {pin} = {data}");
+                info!("Write controller port {port}, pin {pin} = {data}");
             }
             _ => unreachable!(),
+        }
+    }
+
+    fn auto_joypad_read(&mut self) {
+        for port in 0..2 {
+            self.controller_write(port, 3, true);
+            for _ in 0..16 {
+                self.controller_write(port, 2, true);
+                self.controller_write(port, 2, false);
+            }
         }
     }
 }

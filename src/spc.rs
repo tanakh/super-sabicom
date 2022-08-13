@@ -433,9 +433,7 @@ impl Spc {
                 let port = (addr - 4) as u8;
                 self.sync_port(port, self.counter, false);
                 let data = self.ioregs.cpuin[port as usize][0].1;
-                if addr - 4 == 1 {
-                    debug!("CPUIO {port} -> {data:#04X} @ {}", self.counter);
-                }
+                debug!("CPUIO {port} -> {data:#04X} @ {}", self.counter);
                 data
             }
             8..=9 => self.ioregs.ext_io[addr as usize - 8],
@@ -510,9 +508,7 @@ impl Spc {
             3 => self.dsp.write(self.ioregs.dsp_reg, data),
             4..=7 => {
                 let port = (addr - 4) as u8;
-                if addr - 4 == 1 {
-                    debug!("CPUIO {port} <- {data:#04X} @ {}", self.counter);
-                }
+                debug!("CPUIO {port} <- {data:#04X} @ {}", self.counter);
                 // FIXME: Delay?
                 self.ioregs.cpuout[port as usize].push_back((self.counter + 2, data));
             }
@@ -528,17 +524,6 @@ impl Spc {
 
 impl Spc {
     pub fn exec_one(&mut self) {
-        static LAST_CYCLE: AtomicU64 = AtomicU64::new(0);
-
-        if self.counter - LAST_CYCLE.load(Ordering::Relaxed) > 10000 {
-            log::info!("CYCLE: {}", self.counter);
-            LAST_CYCLE.store(self.counter, Ordering::Relaxed);
-        }
-
-        if self.counter >= 1246965 && log::log_enabled!(Level::Trace) {
-            self.trace();
-        }
-
         macro_rules! bus_log {
             ($n:expr) => {
                 // for _ in 0..$n {

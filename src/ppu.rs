@@ -65,6 +65,7 @@ pub struct Ppu {
     obj_time_overflow: bool,
     hdma_reload: bool,
     hdma_transfer: bool,
+    auto_joypad_read: bool,
 
     mosaic_vofs: [u8; 4],
     mosaic_vsize: [u8; 4],
@@ -491,6 +492,12 @@ impl Ppu {
         self.hdma_transfer = false;
         ret
     }
+
+    pub fn auto_joypad_read(&mut self) -> bool {
+        let ret = self.auto_joypad_read;
+        self.auto_joypad_read = false;
+        ret
+    }
 }
 
 impl Ppu {
@@ -560,6 +567,11 @@ impl Ppu {
                 if !self.display_ctrl.force_blank() {
                     self.oam_addr_internal = self.oam_addr.addr() << 1;
                 }
+            }
+
+            // around 32.5..95.5
+            if (self.x, self.y) == (33, 225) {
+                self.auto_joypad_read = true;
             }
 
             if render && self.x == 22 {
