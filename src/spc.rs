@@ -184,6 +184,8 @@ impl Spc {
     }
 
     pub fn clear_audio_buffer(&mut self) {
+        self.dsp.audio_buffer.sample_rate = 32000;
+        self.dsp.audio_buffer.channels = 2;
         self.dsp.audio_buffer.samples.clear();
     }
 

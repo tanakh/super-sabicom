@@ -11,8 +11,9 @@ pub mod spc;
 use crate::context::Context;
 pub use crate::rom::Rom;
 
-use meru_interface::{ConfigUi, EmulatorCore};
+use meru_interface::{ConfigUi, EmulatorCore, Ui};
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 pub struct Snes {
     pub ctx: Context,
@@ -30,13 +31,20 @@ impl Snes {
 pub struct SnesConfig {}
 
 impl ConfigUi for SnesConfig {
-    fn ui(&mut self, ui: &mut egui::Ui) {
-        todo!()
-    }
+    fn ui(&mut self, _ui: &mut impl Ui) {}
+}
+
+#[derive(Error, Debug)]
+pub enum SnesError {
+    #[error("{0}")]
+    RomError(#[from] rom::RomError),
+    #[error("deserialize failed: {0}")]
+    DeserializeFailed(#[from] bincode::Error),
 }
 
 impl EmulatorCore for Snes {
     type Config = SnesConfig;
+    type Error = SnesError;
 
     fn core_info() -> &'static meru_interface::CoreInfo {
         const CORE_INFO: meru_interface::CoreInfo = meru_interface::CoreInfo {
@@ -51,7 +59,7 @@ impl EmulatorCore for Snes {
         data: &[u8],
         backup: Option<&[u8]>,
         config: &Self::Config,
-    ) -> anyhow::Result<Self> {
+    ) -> Result<Self, Self::Error> {
         Ok(Snes::new(rom::Rom::from_bytes(&data)?, backup))
     }
 
@@ -151,13 +159,15 @@ impl EmulatorCore for Snes {
         bincode::serialize(&self.ctx).unwrap()
     }
 
-    fn load_state(&mut self, data: &[u8]) -> anyhow::Result<()> {
+    fn load_state(&mut self, data: &[u8]) -> Result<(), Self::Error> {
         use context::Cartridge;
 
         let mut ctx: Context = bincode::deserialize(data)?;
 
         // Restore ROM and memory mapping
         ctx.cartridge_mut().restore(self.ctx.cartridge_mut());
+
+        self.ctx = ctx;
 
         Ok(())
     }

@@ -263,9 +263,9 @@ impl RomError {
             RomError::InvalidSpeed(_) => 100,
             RomError::InvalidMapMode(_) => 10,
             RomError::InvalidChipset(_, _) => 100,
-            RomError::InvalidRomSizeCode(_) => 100,
+            RomError::InvalidRomSizeCode(_) => 1000,
             RomError::RomSizeDoesNotMatch => 10,
-            RomError::InvalidSramSizeCode(_) => 100,
+            RomError::InvalidSramSizeCode(_) => 1000,
             RomError::InvalidChecksumComplement(_, _) => 10,
             RomError::InvalidChecksum(_, _) => 1,
             RomError::UnknownRomType => 10000,
@@ -373,6 +373,7 @@ fn try_parse_header(bytes: &[u8], header_pos: usize) -> Result<Header, RomError>
     let rom_size_code = header[0xD7];
     if rom_size_code > 0xD {
         errors.push(RomError::InvalidRomSizeCode(rom_size_code));
+        Err(RomError::InvalidRomSizeCode(rom_size_code))?;
     }
 
     let rom_size = (1 << rom_size_code) * 1024;
@@ -383,6 +384,7 @@ fn try_parse_header(bytes: &[u8], header_pos: usize) -> Result<Header, RomError>
     let ram_size_code = header[0xD8];
     if ram_size_code > 9 {
         errors.push(RomError::InvalidSramSizeCode(ram_size_code));
+        Err(RomError::InvalidSramSizeCode(ram_size_code))?;
     }
 
     let sram_size = if ram_size_code == 0 {
