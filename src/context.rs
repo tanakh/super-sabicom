@@ -26,7 +26,7 @@ pub trait Ppu {
 
     fn ppu_read(&mut self, addr: u16, cpu_open_bus: u8) -> u8;
     fn ppu_write(&mut self, addr: u16, data: u8);
-    fn ppu_tick(&mut self, render: bool);
+    fn ppu_tick(&mut self);
 }
 
 #[delegate]
@@ -239,8 +239,8 @@ impl Ppu for Inner2 {
         self.ppu.write(&mut self.inner, addr, data)
     }
 
-    fn ppu_tick(&mut self, render: bool) {
-        self.ppu.tick(&mut self.inner, render)
+    fn ppu_tick(&mut self) {
+        self.ppu.tick(&mut self.inner)
     }
 }
 

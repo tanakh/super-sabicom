@@ -1,4 +1,4 @@
-use log::warn;
+use log::info;
 use serde::{Deserialize, Serialize};
 
 use crate::rom::{MapMode, Rom};
@@ -78,7 +78,7 @@ impl Cartridge {
             Mapping::Rom(offset) => self.rom.rom[(offset + (addr & 0x07ff)) as usize],
             Mapping::Ram(offset) => self.sram[(offset + (addr & 0x7ff)) as usize],
             Mapping::None => {
-                warn!("Reading from unmapped region: {addr:06X}");
+                info!("Reading from unmapped region: {addr:06X}");
                 None?
             }
         })
@@ -87,11 +87,11 @@ impl Cartridge {
     pub fn write(&mut self, addr: u32, data: u8) {
         match self.mapping[(addr >> 11) as usize] {
             Mapping::Rom(_) => {
-                warn!("Writing to ROM region: {addr:06X} = {data:02X}")
+                info!("Writing to ROM region: {addr:06X} = {data:02X}")
             }
             Mapping::Ram(offset) => self.sram[(offset + (addr & 0x7ff)) as usize] = data,
             Mapping::None => {
-                warn!("Writing to unmapped region: {addr:06X} = {data:02X}")
+                info!("Writing to unmapped region: {addr:06X} = {data:02X}")
             }
         }
     }

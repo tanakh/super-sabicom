@@ -3,7 +3,7 @@
 use std::collections::VecDeque;
 
 use educe::Educe;
-use log::{debug, info, warn};
+use log::{debug, info};
 use meru_interface::{FrameBuffer, Pixel};
 use modular_bitfield::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -83,6 +83,9 @@ pub struct Ppu {
 
     open_bus1: u8,
     open_bus2: u8,
+
+    #[serde(skip)]
+    render_graphics: bool,
 
     #[serde(skip)]
     frame_buffer: FrameBuffer,
@@ -503,7 +506,11 @@ impl Ppu {
 }
 
 impl Ppu {
-    pub fn tick(&mut self, ctx: &mut impl Context, render: bool) {
+    pub fn set_render_graphics(&mut self, render: bool) {
+        self.render_graphics = render;
+    }
+
+    pub fn tick(&mut self, ctx: &mut impl Context) {
         loop {
             let short_line =
                 self.display_ctrl.v_scanning() == 0 && self.frame % 2 == 1 && self.y == 240;
@@ -576,10 +583,8 @@ impl Ppu {
                 self.auto_joypad_read = true;
             }
 
-            if render && self.x == 22 {
-                if (1..1 + SCREEN_HEIGHT).contains(&self.y) {
-                    self.render_line(self.y);
-                }
+            if self.x == 22 && (1..1 + SCREEN_HEIGHT).contains(&self.y) {
+                self.render_line(self.y);
             }
 
             // FIXME: 133.5
@@ -950,7 +955,7 @@ impl Ppu {
             }
             0x2133 => self.display_ctrl.bytes[1] = data,
 
-            0x2134..=0x213F => warn!("Write to readonly register: {addr:04X} = {data:#04X}"),
+            0x2134..=0x213F => info!("Write to readonly register: {addr:04X} = {data:#04X}"),
 
             _ => unreachable!(""),
         }
@@ -1157,6 +1162,17 @@ impl Ppu {
             self.frame_buffer.resize(512, 448);
         }
 
+        if self.display_ctrl.force_blank() {
+            let fb_y = (self.y as usize - 1) * 2;
+            let black = Pixel::new(0, 0, 0);
+            for y in 0..2 {
+                for x in 0..self.frame_buffer.width {
+                    *self.frame_buffer.pixel_mut(x, fb_y + y) = black.clone();
+                }
+            }
+            return;
+        }
+
         if self.line_buffer_main.len() != SCREEN_WIDTH as usize {
             self.line_buffer_main.resize(SCREEN_WIDTH as usize, 0);
             self.line_buffer_sub.resize(SCREEN_WIDTH as usize, 0);
@@ -1166,14 +1182,9 @@ impl Ppu {
                 .resize(SCREEN_WIDTH as usize, PixelAttr::default());
         }
 
-        if self.display_ctrl.force_blank() {
-            let fb_y = (self.y as usize - 1) * 2;
-            let black = Pixel::new(0, 0, 0);
-            for y in 0..2 {
-                for x in 0..self.frame_buffer.width {
-                    *self.frame_buffer.pixel_mut(x, fb_y + y) = black.clone();
-                }
-            }
+        if !self.render_graphics {
+            // Count obj number for setting flags
+            self.render_obj(y);
             return;
         }
 
@@ -1660,6 +1671,10 @@ impl Ppu {
                     }
                 }
             }
+        }
+
+        if !self.render_graphics {
+            return;
         }
 
         for i in (0..render_obj_cnt).rev() {

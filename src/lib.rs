@@ -31,7 +31,9 @@ impl Snes {
 pub struct SnesConfig {}
 
 impl ConfigUi for SnesConfig {
-    fn ui(&mut self, _ui: &mut impl Ui) {}
+    fn ui(&mut self, ui: &mut impl Ui) {
+        ui.label("No config options");
+    }
 }
 
 #[derive(Error, Debug)]
@@ -58,7 +60,7 @@ impl EmulatorCore for Snes {
     fn try_from_file(
         data: &[u8],
         backup: Option<&[u8]>,
-        config: &Self::Config,
+        _config: &Self::Config,
     ) -> Result<Self, Self::Error> {
         Ok(Snes::new(rom::Rom::from_bytes(&data)?, backup))
     }
@@ -92,12 +94,13 @@ impl EmulatorCore for Snes {
         use context::*;
 
         self.ctx.spc_mut().clear_audio_buffer();
+        self.ctx.ppu_mut().set_render_graphics(render_graphics);
 
         let start_frame = self.ctx.ppu().frame();
 
         while start_frame == self.ctx.ppu().frame() {
             self.ctx.exec_one();
-            self.ctx.ppu_tick(render_graphics);
+            self.ctx.ppu_tick();
             self.ctx.spc_tick();
             self.ctx.bus_tick();
         }
@@ -126,22 +129,44 @@ impl EmulatorCore for Snes {
         use meru_interface::key_assign::*;
 
         let controller = vec![
-            ("A".to_string(), keycode!(X)),
-            ("B".to_string(), keycode!(Z)),
-            ("X".to_string(), keycode!(S)),
-            ("Y".to_string(), keycode!(A)),
-            ("L".to_string(), keycode!(Q)),
-            ("R".to_string(), keycode!(W)),
-            ("Start".to_string(), keycode!(Return)),
-            ("Select".to_string(), keycode!(LShift)),
-            ("Up".to_string(), keycode!(Up)),
-            ("Down".to_string(), keycode!(Down)),
-            ("Left".to_string(), keycode!(Left)),
-            ("Right".to_string(), keycode!(Right)),
+            ("A", any!(keycode!(X), pad_button!(0, East))),
+            ("B", any!(keycode!(Z), pad_button!(0, South))),
+            ("X", any!(keycode!(S), pad_button!(0, North))),
+            ("Y", any!(keycode!(A), pad_button!(0, West))),
+            ("L", any!(keycode!(Q), pad_button!(0, LeftTrigger))),
+            ("R", any!(keycode!(W), pad_button!(0, RightTrigger))),
+            ("Start", any!(keycode!(Return), pad_button!(0, Start))),
+            ("Select", any!(keycode!(LShift), pad_button!(0, Select))),
+            ("Up", any!(keycode!(Up), pad_button!(0, DPadUp))),
+            ("Down", any!(keycode!(Down), pad_button!(0, DPadDown))),
+            ("Left", any!(keycode!(Left), pad_button!(0, DPadLeft))),
+            ("Right", any!(keycode!(Right), pad_button!(0, DPadRight))),
+        ];
+
+        let empty = vec![
+            ("A", KeyAssign::default()),
+            ("B", KeyAssign::default()),
+            ("X", KeyAssign::default()),
+            ("Y", KeyAssign::default()),
+            ("L", KeyAssign::default()),
+            ("R", KeyAssign::default()),
+            ("Start", KeyAssign::default()),
+            ("Select", KeyAssign::default()),
+            ("Up", KeyAssign::default()),
+            ("Down", KeyAssign::default()),
+            ("Left", KeyAssign::default()),
+            ("Right", KeyAssign::default()),
         ];
 
         meru_interface::KeyConfig {
-            controllers: vec![controller],
+            controllers: vec![controller, empty.clone(), empty.clone(), empty]
+                .into_iter()
+                .map(|kvs| {
+                    kvs.into_iter()
+                        .map(|(key, assign)| (key.to_string(), assign))
+                        .collect()
+                })
+                .collect(),
         }
     }
 

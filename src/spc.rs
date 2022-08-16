@@ -2,15 +2,11 @@
 
 use crate::dsp::Dsp;
 
-use log::{debug, info, trace, warn, Level};
+use log::{debug, info, trace};
 use meru_interface::AudioBuffer;
 use modular_bitfield::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::VecDeque,
-    fmt::Display,
-    sync::atomic::{AtomicU64, Ordering},
-};
+use std::{collections::VecDeque, fmt::Display};
 use super_sabicom_macro::opcodes;
 
 use crate::context;
@@ -411,7 +407,7 @@ impl Spc {
 
         let data = match addr {
             0 => {
-                warn!("Read TEST");
+                info!("Read TEST");
                 0
             }
             1 => {
@@ -506,7 +502,7 @@ impl Spc {
             8..=9 => self.ioregs.ext_io[addr as usize - 8] = data,
             0xA..=0xC => self.ioregs.timer[addr as usize - 0xA].divider = data,
             0xD..=0xF => {
-                warn!("Write Timer {} Counter = {data:#04X}", addr - 0xD);
+                info!("Write Timer {} Counter = {data:#04X}", addr - 0xD);
             }
             _ => unreachable!(),
         }

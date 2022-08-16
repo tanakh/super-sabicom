@@ -300,7 +300,7 @@ impl Rom {
         }
 
         for (_, c) in &candidates {
-            log::warn!("Cand: score: {:?}, errors: {:?}", c.score(), c.errors);
+            log::debug!("Cand: score: {:?}, errors: {:?}", c.score(), c.errors);
         }
 
         let (header_pos_first, header) = candidates

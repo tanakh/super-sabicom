@@ -1,4 +1,4 @@
-use log::{debug, info, trace, warn};
+use log::{debug, info, trace};
 use modular_bitfield::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -235,7 +235,7 @@ impl Bus {
                     if DMA == NOT_DMA {
                         ctx.elapse(CYCLES_FAST);
                     }
-                    warn!("Read unused region (open bus): {bank:02X}:{offset:04X}");
+                    info!("Read unused region (open bus): {bank:02X}:{offset:04X}");
                     self.open_bus
                 }
                 0x2100..=0x21FF => {
@@ -253,7 +253,7 @@ impl Bus {
                     if DMA == NOT_DMA {
                         ctx.elapse(CYCLES_FAST);
                     }
-                    warn!("Read unused region (open bus): {bank:02X}:{offset:04X}");
+                    info!("Read unused region (open bus): {bank:02X}:{offset:04X}");
                     self.open_bus
                 }
                 0x4000..=0x41FF => {
@@ -358,7 +358,7 @@ impl Bus {
                     if DMA == NOT_DMA {
                         ctx.elapse(CYCLES_FAST);
                     }
-                    warn!("Write unused region: {bank:02X}:{offset:04X}");
+                    info!("Write unused region: {bank:02X}:{offset:04X}");
                 }
                 0x2100..=0x21FF => {
                     if DMA == NOT_DMA {
@@ -372,7 +372,7 @@ impl Bus {
                     if DMA == NOT_DMA {
                         ctx.elapse(CYCLES_FAST);
                     }
-                    warn!("Write unused region: {bank:02X}:{offset:04X}")
+                    info!("Write unused region: {bank:02X}:{offset:04X}")
                 }
                 0x4000..=0x41FF => {
                     if DMA == NOT_DMA {
@@ -442,8 +442,7 @@ impl Bus {
 
     fn io_read(&mut self, ctx: &mut impl Context, addr: u16) -> u8 {
         // Sync PPU counter
-        // FIXME: render flag
-        ctx.ppu_tick(true);
+        ctx.ppu_tick();
         self.dma_exec(ctx, false);
 
         let data = match addr {
@@ -539,7 +538,7 @@ impl Bus {
             | 0x4018..=0x420F
             | 0x4220..=0x42FF
             | 0x4380..=0x5FFF => {
-                warn!("Read open bus: {addr:04X}");
+                info!("Read open bus: {addr:04X}");
                 self.open_bus
             }
 
@@ -555,8 +554,7 @@ impl Bus {
 
     fn io_write(&mut self, ctx: &mut impl Context, addr: u16, data: u8) {
         // FIXME: hack for sub-instruction cycle accuracy
-        // FIXME: render flag
-        ctx.ppu_tick(true);
+        ctx.ppu_tick();
         self.dma_exec(ctx, false);
 
         match addr {
@@ -650,7 +648,7 @@ impl Bus {
             0x4300..=0x437F => self.dma_write(((addr >> 4) & 0x7) as _, (addr & 0xF) as _, data),
 
             0x2184..=0x4015 | 0x4017..=0x41FF | 0x420E..=0x42FF | 0x4380..=0x5FFF => {
-                warn!("Write to Unused region: {addr:#06X} = {data:#04X}")
+                info!("Write to Unused region: {addr:#06X} = {data:#04X}")
             }
 
             _ => unreachable!("IO Write: {addr:#06X} = {data:#04X}"),
@@ -672,7 +670,7 @@ impl Bus {
             0xA => self.dma[ch].hdma_line_counter,
             0xB | 0xF => self.dma[ch].unused,
             0xC..=0xE => {
-                warn!("Invalid DMA register read: {cmd:0X}");
+                info!("Invalid DMA register read: {cmd:0X}");
                 self.open_bus
             }
             _ => unreachable!(),
@@ -704,7 +702,7 @@ impl Bus {
             0xB | 0xF => self.dma[ch].unused = data,
 
             0xC..=0xE => {
-                warn!("Invalid DMA register write: {cmd:0X} = {data:#04X}")
+                info!("Invalid DMA register write: {cmd:0X} = {data:#04X}")
             }
 
             _ => unreachable!(),
