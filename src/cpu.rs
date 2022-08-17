@@ -527,6 +527,10 @@ impl Cpu {
             }
         }
 
+        if log::log_enabled!(log::Level::Trace) {
+            self.trace(ctx);
+        }
+
         let opcode = self.fetch8(ctx);
 
         macro_rules! exec_instr {

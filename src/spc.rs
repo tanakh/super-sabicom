@@ -511,18 +511,8 @@ impl Spc {
 
 impl Spc {
     pub fn exec_one(&mut self) {
-        macro_rules! bus_log {
-            ($n:expr) => {
-                // for _ in 0..$n {
-                //     self.bus_log.push((None, None, BusAccessType::Wait));
-                // }
-            };
-            ($n:expr, sync) => {
-                // for _ in 0..$n {
-                //     self.bus_log
-                //         .push((Some(self.regs.pc), None, BusAccessType::Read));
-                // }
-            };
+        if log::log_enabled!(log::Level::Trace) {
+            self.trace();
         }
 
         macro_rules! elapse {

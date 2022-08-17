@@ -28,32 +28,33 @@ impl Snes {
 }
 
 #[derive(Default, Serialize, Deserialize)]
-pub struct SnesConfig {}
+pub struct Config {}
 
-impl ConfigUi for SnesConfig {
+impl ConfigUi for Config {
     fn ui(&mut self, ui: &mut impl Ui) {
         ui.label("No config options");
     }
 }
 
 #[derive(Error, Debug)]
-pub enum SnesError {
+pub enum Error {
     #[error("{0}")]
     RomError(#[from] rom::RomError),
     #[error("deserialize failed: {0}")]
     DeserializeFailed(#[from] bincode::Error),
 }
 
+const CORE_INFO: meru_interface::CoreInfo = meru_interface::CoreInfo {
+    system_name: "Super Famicom",
+    abbrev: "snes",
+    file_extensions: &["sfc", "smc", "swc", "fig"],
+};
+
 impl EmulatorCore for Snes {
-    type Config = SnesConfig;
-    type Error = SnesError;
+    type Config = Config;
+    type Error = Error;
 
     fn core_info() -> &'static meru_interface::CoreInfo {
-        const CORE_INFO: meru_interface::CoreInfo = meru_interface::CoreInfo {
-            system_name: "Super Famicom",
-            abbrev: "snes",
-            file_extensions: &["sfc", "smc", "swc", "fig"],
-        };
         &CORE_INFO
     }
 
