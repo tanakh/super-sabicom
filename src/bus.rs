@@ -1,3 +1,5 @@
+#![allow(dead_code)] // FIXME: Hack for modular-bitfield
+
 use log::{debug, info, trace};
 use modular_bitfield::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -1015,6 +1017,7 @@ impl Bus {
 struct IoRegInfo {
     addr: u16,
     name: &'static str,
+    #[allow(dead_code)]
     desc: &'static str,
 }
 

@@ -1,3 +1,5 @@
+#![allow(dead_code)] // FIXME: Hack for modular-bitfield
+
 use educe::Educe;
 use log::{debug, trace};
 use meru_interface::{AudioBuffer, AudioSample};

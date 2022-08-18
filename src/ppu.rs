@@ -1,4 +1,4 @@
-#![allow(unused_braces)]
+#![allow(dead_code)] // FIXME: Hack for modular-bitfield
 
 use std::collections::VecDeque;
 
@@ -636,7 +636,7 @@ impl Ppu {
         counter.y = self.y;
     }
 
-    pub fn read(&mut self, ctx: &mut impl Context, addr: u16, cpu_open_bus: u8) -> u8 {
+    pub fn read(&mut self, _ctx: &mut impl Context, addr: u16, cpu_open_bus: u8) -> u8 {
         let data = match addr {
             // PPU Picture Processing Unit (Read-Only Ports)
             // 0x2134 - MPYL    - "PPU1 Signed Multiply Result   (lower 8bit)"
@@ -781,7 +781,7 @@ impl Ppu {
         data
     }
 
-    pub fn write(&mut self, ctx: &mut impl Context, addr: u16, data: u8) {
+    pub fn write(&mut self, _ctx: &mut impl Context, addr: u16, data: u8) {
         match addr {
             0x2100 => self.display_ctrl.bytes[0] = data,
             0x2101 => self.obj_sel.bytes[0] = data,
