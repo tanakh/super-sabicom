@@ -14,6 +14,6 @@ keywords = ["emulators", "snes"]
 proc-macro = true
 
 [dependencies]
-proc-macro2 = "1.0.40"
-quote = "1.0.20"
-syn = "1.0.98"
+proc-macro2 = "1.0.43"
+quote = "1.0.21"
+syn = "1.0.99"
