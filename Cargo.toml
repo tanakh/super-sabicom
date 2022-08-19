@@ -5,6 +5,13 @@ members = ["super-sabicom-macro"]
 name = "super-sabicom"
 version = "0.1.0"
 edition = "2021"
+authors = ["Hideyuki Tanaka <tanaka.hideyuki@gmail.com>"]
+license = "MIT"
+description = "SNES emulator"
+repository = "https://github.com/tanakh/super-sabicom"
+readme = "README.md"
+categories = ["emulators"]
+keywords = ["emulators", "snes"]
 
 [dependencies]
 super-sabicom-macro = { path = "super-sabicom-macro", version = "0.1" }

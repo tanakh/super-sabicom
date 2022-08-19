@@ -2,6 +2,13 @@
 name = "super-sabicom-macro"
 version = "0.1.0"
 edition = "2021"
+authors = ["Hideyuki Tanaka <tanaka.hideyuki@gmail.com>"]
+license = "MIT"
+description = "Proc macros for super-sabicom"
+repository = "https://github.com/tanakh/super-sabicom"
+readme = "README.md"
+categories = ["emulators"]
+keywords = ["emulators", "snes"]
 
 [lib]
 proc-macro = true
