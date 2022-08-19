@@ -45,7 +45,7 @@ pub enum Error {
 }
 
 const CORE_INFO: meru_interface::CoreInfo = meru_interface::CoreInfo {
-    system_name: "Super Famicom",
+    system_name: "SNES (Super Sabicom)",
     abbrev: "snes",
     file_extensions: &["sfc", "smc", "swc", "fig"],
 };
