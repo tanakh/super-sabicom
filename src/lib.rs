@@ -11,7 +11,8 @@ pub mod spc;
 use crate::context::Context;
 pub use crate::rom::Rom;
 
-use meru_interface::{ConfigUi, EmulatorCore, Ui};
+use meru_interface::EmulatorCore;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -27,14 +28,8 @@ impl Snes {
     }
 }
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Default, JsonSchema, Serialize, Deserialize)]
 pub struct Config {}
-
-impl ConfigUi for Config {
-    fn ui(&mut self, ui: &mut impl Ui) {
-        ui.label("No config options");
-    }
-}
 
 #[derive(Error, Debug)]
 pub enum Error {

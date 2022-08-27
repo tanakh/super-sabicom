@@ -4,7 +4,7 @@ use std::collections::VecDeque;
 
 use educe::Educe;
 use log::{debug, info};
-use meru_interface::{FrameBuffer, Pixel};
+use meru_interface::{Color, FrameBuffer};
 use modular_bitfield::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -1164,7 +1164,7 @@ impl Ppu {
 
         if self.display_ctrl.force_blank() {
             let fb_y = (self.y as usize - 1) * 2;
-            let black = Pixel::new(0, 0, 0);
+            let black = Color::new(0, 0, 0);
             for y in 0..2 {
                 for x in 0..self.frame_buffer.width {
                     *self.frame_buffer.pixel_mut(x, fb_y + y) = black.clone();
@@ -1873,11 +1873,11 @@ impl Ppu {
     }
 }
 
-fn u16_to_pixel(p: u16) -> Pixel {
+fn u16_to_pixel(p: u16) -> Color {
     let r = (p & 0x1F) as u8;
     let g = ((p >> 5) & 0x1F) as u8;
     let b = ((p >> 10) & 0x1F) as u8;
-    Pixel::new(extend(r), extend(g), extend(b))
+    Color::new(extend(r), extend(g), extend(b))
 }
 
 fn extend(c: u8) -> u8 {
